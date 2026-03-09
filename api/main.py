@@ -101,6 +101,7 @@ class GenerateRequest(BaseModel):
     current_url: Optional[str] = Field(None, alias="currentUrl")
     conversation_id: Optional[int] = Field(None, alias="conversationId")
     user_id: Optional[str] = Field(None, alias="userId")
+    history: List[dict] = [] # 🆕 Added history field
     
     class Config:
         populate_by_name = True
@@ -343,7 +344,7 @@ class ContextRequest(BaseModel):
 async def save_context_endpoint(
     req: ContextRequest,
     authorization: Optional[str] = Header(None)
-):
+    ):
     try:
         user, db = await get_user_from_token(authorization)
         
@@ -1377,8 +1378,8 @@ async def save_chat(
     response: str
 ):
 
-    query_embedding = await embed_text(query)
-    response_embedding = await embed_text(response)
+    combined_text = f"Query: {query}\nResponse: {response}"
+    combined_embedding = await embed_text(combined_text)
 
     db: Session = SessionLocal()
 
@@ -1388,9 +1389,9 @@ async def save_chat(
             user_id=user_id,
             url=url,
             query=query,
-            query_embedding=query_embedding,
+            query_embedding=combined_embedding,
             response=response,
-            response_embedding=response_embedding
+            response_embedding=combined_embedding
         )
 
         db.add(chat)
@@ -1401,144 +1402,165 @@ async def save_chat(
 
 
 
+
+# ============================================================
+# generate_stream endpoint
+# ============================================================
+
+# Keywords that indicate the user is asking about the current page
+
+PAGE_CONTEXT_KEYWORDS = [
+    # original
+    "this", "current", "here", "page", "these", "above",
+    "product", "item", "summarize", "summary", "explain this",
+    "what does it say", "on this", "listed", "shown", "describe",
+
+    # 🔹 fuzzy page references
+    "content", "contents", "page contents", "the content",
+    "the contents", "material", "text", "texts", "the text",
+    "information", "details", "data", "info",
+
+    # 🔹 demonstrative vague refs
+    "this page", "this content", "this text", "this material",
+    "this info", "this information", "this thing",
+    "that page", "that content", "that text",
+    "the above", "above content", "above text",
+    "below", "below content",
+
+    # 🔹 user intent verbs (very important)
+    "summarize this", "summarise this", "explain this",
+    "explain it", "describe this", "describe it",
+    "tell me about this", "tell me about it",
+    "what is this", "what's this",
+    "what does this say", "what does it say",
+    "give summary", "give a summary",
+    "brief this", "analyze this", "analyse this",
+
+    # 🔹 shopping/product fuzzy
+    "this product", "this item", "this listing",
+    "the product", "the item", "the listing",
+    "product details", "item details",
+
+    # 🔹 weak conversational references (high value)
+    "it", "this one", "that one", "the above one",
+    "shown here", "shown above", "shown below",
+    "on the page", "from the page",
+    "from here", "from this page",
+
+    # 🔹 reading intent
+    "read this", "read it", "interpret this",
+    "what is written", "what's written",
+    "what is mentioned", "what's mentioned",
+    "what is described", "what's described",
+]
+
+def likely_page_context(query: str) -> bool:
+    q = query.lower()
+
+    # keyword hit
+    if any(k in q for k in PAGE_CONTEXT_KEYWORDS):
+        return True
+
+    # very short vague queries are usually page-context
+    if len(q.split()) <= 4 and any(
+        word in q for word in ["this", "it", "above", "here"]
+    ):
+        return True
+
+    return False
+
+
 @app.post("/generate/stream")
 async def generate_stream(
     req: GenerateRequest,
     background_tasks: BackgroundTasks,
     authorization: Optional[str] = Header(None)
-):
+    ):
 
     async def stream():
 
         full_response = ""
 
-        # -----------------------------
-        # STEP 1: Get user
-        # -----------------------------
+        # --------------------------------------------------------
+        # STEP 1: Authenticate user
+        # --------------------------------------------------------
         try:
             user, _ = await get_user_from_token(authorization)
             user_id = str(user.id)
         except:
             user_id = "default_user"
 
-        # -----------------------------
-        # STEP 2: Embed query
-        # -----------------------------
-        query_embedding = await embed_text(req.prompt) 
+        # --------------------------------------------------------
+        # STEP 2: Build chat history (sliding window: last 20 msgs)
+        # Frontend maintains the full array, we just window it
+        # --------------------------------------------------------
+        raw_history = req.history or []
+        windowed_history = raw_history[-20:] if len(raw_history) > 20 else raw_history
 
-        memory_context = await get_memory_context(user_id, req.conversation_id, query_embedding)
+        chat_history = []
+        for msg in windowed_history:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "user":
+                chat_history.append(HumanMessage(content=content))
+            elif role in ["assistant", "ai", "bot"]:
+                chat_history.append(AIMessage(content=content))
 
-        # -----------------------------
-        # STEP 3: Check query_history cache
-        # -----------------------------
-        db: Session = SessionLocal() 
- 
-        try:
-
-            stmt = (
-                select(
-                    QueryHistory,
-                    QueryHistory.query_embedding.cosine_distance(query_embedding).label("distance")
-                )
-                .where(QueryHistory.user_id == user_id)
-                .where(QueryHistory.url == req.current_url)
-                .order_by("distance")
-                .limit(1)
-                )
-
-            result = db.execute(stmt).first()
-
-            if result:
-
-                chat, distance = result
-
-                if distance < SIMILARITY_THRESHOLD:
-
-                    print("⚡ Returning cached response")
-
-                    yield json.dumps({
-                        "type": "text",
-                        "data": chat.response
-                    }) + "\n\n"
-
-                    yield json.dumps({"type": "done"}) + "\n\n"
-
-                    return
-
-        finally:
-            db.close()
-
-        # -----------------------------
-        # STEP 4: Retrieve page context
-        # -----------------------------
-        retrieved_context = vector_store.get_relevant_context(
-            user_id=user_id,
-            query=req.prompt,
-            conversation_id=req.conversation_id,
-            current_url=req.current_url
+        # --------------------------------------------------------
+        # STEP 3: Decide if page context is needed BEFORE
+        # hitting the vector DB — skip entirely for general queries
+        # --------------------------------------------------------
+        prompt_lower = req.prompt.lower()
+        asks_about_current_page = any(
+            keyword in prompt_lower
+            for keyword in PAGE_CONTEXT_KEYWORDS
         )
 
-        print(f"📊 Retrieved {len(retrieved_context)} chars")
+        retrieved_context = ""
 
-        asks_about_current_page = any(word in req.prompt.lower() for word in [
-            "this", "current", "here", "page", "these", "above", "product", "item"
-        ])
+        if asks_about_current_page and (req.current_url or req.conversation_id):
+            retrieved_context = vector_store.get_relevant_context(
+                user_id=user_id,
+                query=req.prompt,
+                conversation_id=req.conversation_id,
+                current_url=req.current_url
+            )
+            print(f"📊 Retrieved {len(retrieved_context)} chars of page context")
 
+        # If user asked about the page but we have no context, bail early
         if asks_about_current_page and not retrieved_context:
-
             yield json.dumps({
                 "type": "text",
                 "data": "I don't have access to this page yet. Please refresh or describe it."
             }) + "\n\n"
-
             yield json.dumps({"type": "done"}) + "\n\n"
-
             return
 
-        # -----------------------------
-        # STEP 5: Create chain
-        # -----------------------------
+        # --------------------------------------------------------
+        # STEP 4: Build chain — context-aware or plain
+        # --------------------------------------------------------
         if retrieved_context:
-
-            page_context = {
-                "head": {
-                    "title": "Page",
-                    "description": ""
-                },
-                "content": retrieved_context
-            }
-
             chain = create_context_aware_chain(
-                page_context=page_context,
+                page_context={
+                    "head": {"title": "Page", "description": ""},
+                    "content": retrieved_context
+                },
                 use_context=True,
                 video_transcripts=None,
                 image_url=req.image_url
             )
-
         else:
-
             chain = runnable_chain
 
-        # -----------------------------
-        # STEP 6: Stream LLM response
-        # -----------------------------
-        full_prompt = req.prompt
-
-        if memory_context:
-            full_prompt = f"""
-            Previous conversation:
-            {memory_context}
-
-            Current question:
-            {req.prompt}
-            """
-
-        async for msg in chain.astream({"question": full_prompt}):
-
+        # --------------------------------------------------------
+        # STEP 5: Stream LLM response
+        # --------------------------------------------------------
+        async for msg in chain.astream({
+            "question": req.prompt,
+            "chat_history": chat_history
+        }):
             if msg and msg.content:
-
                 full_response += msg.content
-
                 yield json.dumps({
                     "type": "text",
                     "data": msg.content
@@ -1546,38 +1568,15 @@ async def generate_stream(
 
         yield json.dumps({"type": "done"}) + "\n\n"
 
-        # -----------------------------
-        # STEP 7: Save chat to DB
-        # -----------------------------
-        async def save_chat_task():
-            db: Session = SessionLocal()
-            try:
-                response_embedding = await embed_text(full_response)
-                chat = QueryHistory(
-                    user_id=user_id,
-                    conversation_id=req.conversation_id, # 🆕 Save chat isolation
-                    url=req.current_url,
-                    query=req.prompt,
-                    query_embedding=query_embedding,
-                    response=full_response,
-                    response_embedding=response_embedding
-                )
-                db.add(chat)
-                db.commit()
-                print("✅ Cache saved to QueryHistory")
-            except Exception as e:
-                print(f"❌ Error saving cache: {e}")
-            finally:
-                db.close()
-
-        background_tasks.add_task(save_chat_task)
-
-        # Also save to conversation history if ID is provided
+        # --------------------------------------------------------
+        # STEP 6: Persist to SQL conversation history (background)
+        # No vector DB writes here — history array handles memory
+        # --------------------------------------------------------
         if req.conversation_id:
             background_tasks.add_task(
-                save_message_and_summary, 
-                req.conversation_id, 
-                req.prompt, 
+                save_message_and_summary,
+                req.conversation_id,
+                req.prompt,
                 full_response
             )
 
@@ -1590,7 +1589,6 @@ async def generate_stream(
             "X-Accel-Buffering": "no",
         },
     )
-# -------------------------
 # AGENT MODE ENDPOINT (FIXED - NOW SENDS INTENT ANALYSIS)
 # -------------------------
 
@@ -1772,7 +1770,21 @@ async def agent_stream(
             # ======================================================
             # 6️⃣ STREAM EXPLANATION TOKENS
             # ======================================================
-            async for msg in explain_chain_used.astream({"question": req.prompt}):
+            raw_history = req.history or []
+            windowed_history = raw_history[-10:] if len(raw_history) > 10 else raw_history
+            chat_history = []
+            for msg in windowed_history:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                if role == "user":
+                    chat_history.append(HumanMessage(content=content))
+                elif role in ["assistant", "ai", "bot"]:
+                    chat_history.append(AIMessage(content=content))
+
+            async for msg in explain_chain_used.astream({
+                "question": req.prompt,
+                "chat_history": chat_history
+            }):
                 if msg and msg.content:
                     yield json.dumps({
                         "type": "text",

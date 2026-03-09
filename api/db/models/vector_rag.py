@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Text, Integer, BigInteger, TIMESTAMP
+from sqlalchemy import Column, Text, Integer, BigInteger, TIMESTAMP, String
 from sqlalchemy.sql import func
 from pgvector.sqlalchemy import Vector
 from sqlalchemy.orm import declarative_base
@@ -15,4 +15,5 @@ class PageChunk(Base):
     chunk_index = Column(Integer, nullable=False)
     content = Column(Text, nullable=False)
     embedding = Column(Vector(1536), nullable=False)
+    content_hash = Column(String(32), index=True)  # 👈 add this
     created_at = Column(TIMESTAMP, server_default=func.now())

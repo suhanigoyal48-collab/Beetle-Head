@@ -30,11 +30,29 @@ app.post("/media/upload", async (req, res) => {
     }
 }); 
 
+async function getImageBase64(imageUrl) {
+    const imageBuffer = await axios.get(imageUrl,{
+        responseType: "arraybuffer"
+    });
+    return Buffer.from(imageBuffer.data).toString("base64");
+}
 app.post("/chat", async (req, res) => {
     try {
         console.log("hitting api")
+        const {image_url,model,stream} = req.body;
+        const modelName = model || "gemma3:4b";
+        const streamBool = stream || true;
+        let imageBase64;
+        if(image_url){
+            imageBase64 = await getImageBase64(image_url);
+        }
+        if (imageBase64 && req.body.messages?.length) {
+            req.body.messages[req.body.messages.length - 1].images = [imageBase64];
+        }
+        req.body.model = modelName;
+        req.body.stream = streamBool;
         const response = await axios.post("http://localhost:11434/api/chat", req.body, {
-            responseType: "stream"
+            responseType: "stream"  
         });
         // console.log("data",response.data)
         res.setHeader("Content-Type", "application/json");

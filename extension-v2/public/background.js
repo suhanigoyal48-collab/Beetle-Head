@@ -299,7 +299,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   // 🆕 17️⃣ START AGENT LOOP (Tool-based)
   if (message.type === "START_AGENT_LOOP") {
-    startAgentLoop(message.tabId, message.goal)
+    startAgentLoop(message.tabId, message.goal, message.history || [])
       .then(result => sendResponse(result))
       .catch(err => sendResponse({ success: false, error: err.message }));
     return true;

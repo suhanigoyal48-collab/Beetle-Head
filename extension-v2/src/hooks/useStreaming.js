@@ -55,7 +55,16 @@ export function useStreaming() {
             const res = await fetch(API.CHAT, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-                body: JSON.stringify({ prompt: text, imageUrl, currentUrl, conversationId }),
+                body: JSON.stringify({
+                    prompt: text,
+                    imageUrl,
+                    currentUrl,
+                    conversationId,
+                    history: state.messages.map(m => ({
+                        role: m.role === 'bot' ? 'assistant' : m.role,
+                        content: m.content
+                    }))
+                }),
                 signal: controller.signal
             });
 
@@ -134,7 +143,7 @@ export function useStreaming() {
             dispatch({ type: 'SET_STREAMING', value: false });
             abortControllerRef.current = null;
         }
-    }, [state.accessToken, addMessage, ensureConversationId, dispatch, abortControllerRef]);
+    }, [state.accessToken, state.messages, addMessage, ensureConversationId, dispatch, abortControllerRef]);
 
     const streamAgentManifest = useCallback(async (text, tabId) => {
         dispatch({ type: 'CLEAR_AGENT_STEPS' });
@@ -146,7 +155,11 @@ export function useStreaming() {
             const response = await chrome.runtime.sendMessage({
                 type: 'START_AGENT_LOOP',
                 tabId: tabId,
-                goal: text
+                goal: text,
+                history: state.messages.map(m => ({
+                    role: m.role === 'bot' ? 'assistant' : m.role,
+                    content: m.content
+                }))
             });
 
             if (response && response.success) {
@@ -171,7 +184,7 @@ export function useStreaming() {
             dispatch({ type: 'SET_STREAMING', value: false });
             abortControllerRef.current = null;
         }
-    }, [addMessage, dispatch, abortControllerRef]);
+    }, [addMessage, state.messages, dispatch, abortControllerRef]);
 
     const abortStream = useCallback(() => {
         if (abortControllerRef.current) {

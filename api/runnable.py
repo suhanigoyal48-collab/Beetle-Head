@@ -7,7 +7,7 @@ from pathlib import Path
 import assemblyai as aai
 import time
 from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.runnables import RunnableLambda
@@ -355,47 +355,11 @@ context_analyzer_chain = context_analyzer_prompt | context_analyzer_llm | JsonOu
 # CONTEXT-AWARE CHAT WITH VIDEO SUPPORT
 # ======================================================
 
-context_aware_chat_prompt = ChatPromptTemplate.from_template("""
-You are a helpful AI assistant.
-
-{context_section}
-
-{video_context_section}
-
-Question: {question}
-
-STRICT OUTPUT FORMATTING RULES (MANDATORY):
-- Use VALID Markdown
-- Use ## for question headings
-- Use ### for sub-sections
-- Use bullet points for steps
-- Use numbered lists for answers
-- ALWAYS put equations in LaTeX blocks:
-
-  \\[
-  \\frac{{a}}{{b}}
-  \\]
-
-- NEVER write math like: ( \\frac{{1}}{{2}} )
-- NEVER wrap LaTeX in parentheses
-- Leave ONE blank line before and after headings
-- Do NOT dump raw text blocks
-- Keep answers readable and structured
-
-If page context is provided:
-- Use ONLY the given page content
-- Do NOT assume anything not present
-- For quizzes or assignments, read questions carefully
-- Explain answers step by step when asked
-
-If video transcript is provided:
-- Reference the video content accurately
-- You can quote or paraphrase from the transcript
-- Explain video topics clearly
-- Answer questions based on what was said in the video
-
-Be accurate, structured, and cleanly formatted.
-""")
+context_aware_chat_prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a helpful AI assistant.\n\n{context_section}\n\n{video_context_section}\n\nSTRICT OUTPUT FORMATTING RULES (MANDATORY):\n- Use VALID Markdown\n- Use ## for question headings\n- Use ### for sub-sections\n- Use bullet points for steps\n- Use numbered lists for answers\n- ALWAYS put equations in LaTeX blocks:\n\n  \\[\n  \\frac{{a}}{{b}}\n  \\]\n\n- NEVER write math like: ( \\frac{{1}}{{2}} )\n- NEVER wrap LaTeX in parentheses\n- Leave ONE blank line before and after headings\n- Do NOT dump raw text blocks\n- Keep answers readable and structured\n\nIf page context is provided:\n- Use ONLY the given page content\n- Do NOT assume anything not present\n- For quizzes or assignments, read questions carefully\n- Explain answers step by step when asked\n\nIf video transcript is provided:\n- Reference the video content accurately\n- You can quote or paraphrase from the transcript\n- Explain video topics clearly\n- Answer questions based on what was said in the video\n\nBe accurate, structured, and cleanly formatted."),
+    MessagesPlaceholder(variable_name="chat_history"),
+    ("human", "{question}")
+])
 
 context_aware_chat_llm = ChatOpenAI(
     model="gpt-4o-mini",
@@ -540,14 +504,20 @@ def create_context_aware_chain(page_context=None, use_context=False, video_trans
     if image_url:
         def vision_mapper(inputs):
             question = inputs.get("question", "")
-            rendered_prompt = prompt_template.format(question=question)
+            history = inputs.get("chat_history", [])
+            rendered_prompt = prompt_template.format(question=question, chat_history=[]) # Format without history for the text Part
             
-            return [
-                HumanMessage(content=[
-                    {"type": "text", "text": rendered_prompt},
-                    {"type": "image_url", "image_url": {"url": image_url}}
-                ])
-            ]
+            messages = []
+            # Add history messages
+            messages.extend(history)
+            
+            # Add the current human message with image
+            messages.append(HumanMessage(content=[
+                {"type": "text", "text": rendered_prompt},
+                {"type": "image_url", "image_url": {"url": image_url}}
+            ]))
+            
+            return messages
         
         return RunnableLambda(vision_mapper) | context_aware_chat_llm
     else:
@@ -557,13 +527,11 @@ def create_context_aware_chain(page_context=None, use_context=False, video_trans
 # ORIGINAL CHAT CHAIN (FROM WORKING VERSION)
 # ======================================================
 
-chat_prompt = ChatPromptTemplate.from_template("""
-You are a helpful AI assistant.
-Answer clearly and concisely.
-
-Question:
-{question}
-""")
+chat_prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a helpful AI assistant.\nAnswer clearly and concisely."),
+    MessagesPlaceholder(variable_name="chat_history"),
+    ("human", "{question}")
+])
 
 chat_llm = ChatOpenAI(
     model="gpt-4o-mini",
