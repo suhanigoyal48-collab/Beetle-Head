@@ -1,4 +1,6 @@
-# main.py
+# main.py - Central API entry point and orchestration layer
+# This file defines the FastAPI application, LangGraph workflow, and SSE streaming logic.
+
 import json
 import asyncio
 from typing import Optional, TypedDict, List, Any
@@ -66,42 +68,51 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from embedding import embed_text
 
 # ======================================================
-# GRAPH STATE
+# GRAPH STATE - Defines the shared data structure for LangGraph nodes
 # ======================================================
 
 class AgentState(TypedDict, total=False):
-    question: str
-    image_url: Optional[str]
-    raw_html: Optional[Any]
-    current_url: Optional[str]
+    """
+    Represents the state of a single AI request/conversation turn.
+    Expected by: LangGraph nodes (video_analyzer, page_context_analyzer, etc.)
+    """
+    question: str                # User's natural language input
+    image_url: Optional[str]     # Optional base64 or URL image for vision tasks
+    raw_html: Optional[Any]      # Raw DOM/HTML context from the extension
+    current_url: Optional[str]   # URL of the active browser tab
     
-    # analysis
-    needs_video: bool
-    needs_context: bool
-    needs_actions: bool
-    classification: dict
-    youtube_url: Optional[str]
+    # Analysis Flags
+    needs_video: bool            # True if the query requires YouTube transcription
+    needs_context: bool          # True if the query requires page context
+    needs_actions: bool          # True if the query requires browser automation
+    classification: dict         # Results from classifier_chain (intent, rich content types)
+    youtube_url: Optional[str]   # Detected YouTube video URL if any
 
-    # data
-    video_transcripts: List[dict]
-    page_context: Optional[dict]
+    # Processed Data
+    video_transcripts: List[dict]# List of transcripts from AssemblyAI/YouTube
+    page_context: Optional[dict] # Cleaned and parsed DOM context
 
-    # decision
-    chat_mode: str
+    # Decisioning
+    chat_mode: str               # "context" or "simple" based on data availability
 
 
 # ======================================================
-# REQUEST SCHEMA
+# REQUEST SCHEMA - Pydantic models for API validation
 # ======================================================
 
 class GenerateRequest(BaseModel):
-    prompt: str
-    image_url: Optional[str] = Field(None, alias="imageUrl")
-    context: Optional[Any] = None
-    current_url: Optional[str] = Field(None, alias="currentUrl")
-    conversation_id: Optional[int] = Field(None, alias="conversationId")
-    user_id: Optional[str] = Field(None, alias="userId")
-    history: List[dict] = [] # 🆕 Added history field
+    """
+    Payload for /generate/stream and /chat endpoints.
+    Expected from: Frontend extension
+    """
+    prompt: str                                          # User query
+    image_url: Optional[str] = Field(None, alias="imageUrl") # Vision input
+    context: Optional[Any] = None                        # Raw DOM context fallback
+    current_url: Optional[str] = Field(None, alias="currentUrl") # Active tab URL
+    conversation_id: Optional[int] = Field(None, alias="conversationId") # SQL DB key
+    user_id: Optional[str] = Field(None, alias="userId") # Auth identifier
+    model: str = "openai"                                # Preferred LLM ("openai" | "ollama")
+    history: List[dict] = []                              # Previous chat messages for memory
     
     class Config:
         populate_by_name = True
@@ -121,10 +132,15 @@ class SnapshotRequest(BaseModel):
 
 
 # ======================================================
-# GRAPH NODES (NO STREAMING HERE)
+# GRAPH NODES - Logic steps executed in the background
 # ======================================================
 
 def video_analyzer(state: AgentState):
+    """
+    Node: Analyzes if a YouTube video is involved and needs transcription.
+    Triggers: `video_context_analyzer_chain` in runnable.py
+    Expects: `question` and `current_url` in AgentState
+    """
     current_url = state.get("current_url") or ""
     yt = extract_youtube_url(current_url)
     
@@ -138,6 +154,7 @@ def video_analyzer(state: AgentState):
             "youtube_url": None
         }
 
+    # Calls LLM to decide if transcript is actually needed for the specific question
     result = video_context_analyzer_chain.invoke({
         "question": state["question"],
         "has_videos": "true" if yt else "false"
@@ -149,11 +166,16 @@ def video_analyzer(state: AgentState):
 
 
 def page_context_analyzer(state: AgentState):
+    """
+    Node: Detects if the user query refers to the content of the active tab.
+    Triggers: `context_analyzer_chain` in runnable.py
+    Expects: `question` in AgentState
+    """
     # If page_context is already present (e.g. from vector store retrieval), use it.
     if state.get("page_context"):
         return {"needs_context": True}
 
-    # Otherwise, check if we need to retrieve it
+    # Asks LLM if question requires scraping/reading the page
     result = context_analyzer_chain.invoke({
         "question": state["question"]
     })
@@ -163,7 +185,11 @@ def page_context_analyzer(state: AgentState):
 
 
 def action_intent_analyzer(state: AgentState):
-    """NEW: Analyze if browser actions are needed"""
+    """
+    Node: Categorizes if the request requires browser automation (clicks, navigation).
+    Triggers: `action_intent_chain` in runnable.py
+    Expects: `question`, `raw_html`, `current_url`
+    """
     result = action_intent_chain.invoke({
         "question": state["question"],
         "has_context": "true" if state.get("raw_html") else "false",
@@ -175,6 +201,12 @@ def action_intent_analyzer(state: AgentState):
 
 
 def intent_classifier(state: AgentState):
+    """
+    Node: Primary classifier that determines the general intent (shopping, info, tutorial).
+    Triggers: `classifier_chain` in runnable.py
+    Expects: `question`
+    Returns: `classification` dict containing rich content requirements.
+    """
     return {
         "classification": classifier_chain.invoke({
             "question": state["question"]
@@ -183,6 +215,11 @@ def intent_classifier(state: AgentState):
 
 
 def transcribe_video(state: AgentState):
+    """
+    Node: Downloads and transcribes YouTube audio if required.
+    Triggers: `get_youtube_transcript` in runnable.py (External API: AssemblyAI)
+    Expects: `needs_video` flag and `youtube_url` in state.
+    """
     if not state.get("needs_video") or not state.get("youtube_url"):
         return {"video_transcripts": []} 
 
@@ -197,30 +234,35 @@ def transcribe_video(state: AgentState):
 
 
 def parse_html(state: AgentState):
+    """
+    Node: Sanitizes and truncates raw DOM trees into LLM-friendly text.
+    Triggers: `extract_clean_text_from_dom` and `RecursiveCharacterTextSplitter`.
+    Expects: `raw_html` (dict from extractDOMTree or string).
+    Returns: `page_context` with head metadata and limited body content.
+    """
     if not state.get("needs_context") or not state.get("raw_html"):
         return {}
 
     raw = state["raw_html"]
     parsed = {}
     
-    # Path 1: Already a dictionary (from extractDOMTree in extension)
+    # Logic Step: Handle pre-structured DOM tree from extension
     if isinstance(raw, dict):
-        # Use our new heavy filtering
         from utils.text_processing import extract_clean_text_from_dom, limit_context
         
-        # 1. Extract clean text (Try direct content first, then DOM tree)
+        # 1. Extract clean text (Try direct textContent first, then traverse DOM)
         content = raw.get("textContent") or raw.get("content")
         dom_tree = raw.get("domTree")
         
         if not content:
             content = extract_clean_text_from_dom(dom_tree)
         
-        # 2. Limit context using RecursiveCharacterTextSplitter (DIRECTLY)
+        # 2. Token Limit: Split and keep only the first 20 chunks (~10k chars) to avoid LLM context overflow
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
         chunks = text_splitter.split_text(content)
-        content = "\n\n".join(chunks[:20]) # Limit to ~10k chars
+        content = "\n\n".join(chunks[:20])
         
-        # Ensure head is a dictionary for runnable.py
+        # Metadata extraction for the prompt
         title = raw.get("title") or ""
         metadata = raw.get("metadata")
         
@@ -236,7 +278,7 @@ def parse_html(state: AgentState):
             "content": content,
             "dom_tree": dom_tree
         }
-    # Path 2: Raw HTML string
+    # Logic Step: Fallback for raw HTML string
     else:
         parsed = extract_readable_page(raw)
 
@@ -345,22 +387,28 @@ async def save_context_endpoint(
     req: ContextRequest,
     authorization: Optional[str] = Header(None)
     ):
+    """
+    Endpoint: Save scraped page context to the Vector Store.
+    Triggered by: Frontend extension on tab selection/refresh.
+    Expects: URL and raw_html (domTree JSON).
+    Functions: `vector_store.process_and_save_context`
+    """
     try:
+        # Auth: Verify requester identity
         user, db = await get_user_from_token(authorization)
         
-        # Check if already embedded to avoid re-parsing and re-uploading
+        # Logic Step: Prevent redundant embedding if conversation already has this context
         if req.conversation_id:
             if vector_store.has_context(str(user.id), req.url, req.conversation_id):
                 return {"status": "skipped", "message": "Already embedded for this tab/conversation"}
         
-        # Extract text from DOM
+        # Logic Step: Pre-process DOM into clean text before vectorizing
         from utils.text_processing import extract_clean_text_from_dom
         
         content = ""
         if req.raw_html:
-            # Try direct content first
             content = req.raw_html.get("textContent") or req.raw_html.get("content")
-            dom_tree = req.raw_html.get("domTree", req.raw_html)  # handle if raw_html IS the domTree
+            dom_tree = req.raw_html.get("domTree", req.raw_html) 
             
             if not content:
                 content = extract_clean_text_from_dom(dom_tree)
@@ -368,8 +416,7 @@ async def save_context_endpoint(
         if not content:
             return {"status": "skipped", "message": "No content to save"}
             
-        print("content",content)
-        # Save to Vector Store
+        # Logic Step: Chunk, embed, and store in vector database (PageChunk + ChatContext tables)
         count = await vector_store.process_and_save_context(
             user_id=str(user.id),
             conversation_id=req.conversation_id,
@@ -381,7 +428,6 @@ async def save_context_endpoint(
         
     except Exception as e:
         print(f"Context save error: {e}")
-        # Don't fail the request, just log
         return {"status": "error", "message": str(e)}
 
 
@@ -418,9 +464,15 @@ def get_db():
         
 @app.post("/login")
 async def user_login(req: LoginRequest, response: Response):
+    """
+    Endpoint: Google OAuth Login / User Synchronization.
+    Triggered by: Frontend on successful Google login.
+    Expects: `googleToken`.
+    Functions: Verifies with Google API, Upserts User in SQL DB, issues JWT.
+    """
     db = SessionLocal() 
     try:
-        # 1. Verify token with Google
+        # Step 1: Identity Verification via Google
         async with httpx.AsyncClient() as client:
             google_res = await client.get(
                 "https://www.googleapis.com/oauth2/v2/userinfo",
@@ -434,39 +486,40 @@ async def user_login(req: LoginRequest, response: Response):
             name = user_data.get("name")
             user_dp = user_data.get("picture")
 
-        # 2. Check if user exists
+        # Step 2: Database Persistence (Upsert)
         user = db.query(User).filter(User.email == email).first()
         
         if not user:
-            # Create new user (Sign up)
+            # New User registration
             user = User(
                 name=name,
                 email=email,
                 user_dp=user_dp,
-                credits=10.0 # Starting credits
+                credits=10.0 
             )
             db.add(user)
             db.commit()
             db.refresh(user)
             message = "User created"
         else:
-            # Existing user (Login)
-            user.name = name # Update name/dp if changed
+            # Existing User update (sync name/picture)
+            user.name = name 
             user.user_dp = user_dp
             db.commit()
             message = "Logged in"
 
-        # 3. Generate Backend JWT
+        # Step 3: Session Management
+        # Generate our own internal JWT to avoid passing raw Google tokens in headers
         access_token = create_access_token(data={"sub": user.email})
         
-        # 4. Set cookie
+        # Set HttpOnly cookie for security (prevent XSS access to session)
         response.set_cookie(
             key="session_token",
             value=access_token,
             httponly=True,
             max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
             samesite="lax",
-            secure=False # Set to True in production with HTTPS
+            secure=False 
         )
 
         return {
@@ -562,9 +615,13 @@ async def generate_conversation_title(conversation_id: int):
 async def create_conversation(
     authorization: Optional[str] = Header(None)
 ):
-    """Create a new conversation"""
+    """
+    Endpoint: Initialize a new chat session.
+    Triggered by: Frontend "+" button or first message in a new window.
+    Expects: Auth Header.
+    Returns: `conversation_id`.
+    """
     user, db = await get_user_from_token(authorization)
-    print(user,db)
     try:
         conversation = Conversation(
             user_id=user.id,
@@ -572,7 +629,6 @@ async def create_conversation(
         db.add(conversation)
         db.commit()
         db.refresh(conversation)
-        print(conversation.id)
         return {"status": "success", "conversation_id": conversation.id}
     except Exception as e:
         db.rollback()
@@ -616,9 +672,15 @@ async def add_message(
     background_tasks: BackgroundTasks,
     authorization: Optional[str] = Header(None)
 ):
-    """Add a message pair (query + response) to a conversation"""
+    """
+    Endpoint: Persist a finished chat turn (User Query + AI Response).
+    Triggered by: Frontend after streaming is complete.
+    Expects: `user_query`, `ai_response`.
+    Logic: Saves message and triggers background auto-titling if needed.
+    """
     user, db = await get_user_from_token(authorization)
     try:
+        # Step 1: Ownership Verification
         conversation = db.query(Conversation).filter(
             Conversation.id == conversation_id, 
             Conversation.user_id == user.id
@@ -627,7 +689,7 @@ async def add_message(
         if not conversation:
             raise HTTPException(status_code=404, detail="Conversation not found")
 
-        # Create message
+        # Step 2: Persistence
         message = Message(
             conversation_id=conversation.id,
             user_query=message_data.user_query,
@@ -636,7 +698,8 @@ async def add_message(
         db.add(message)
         db.commit()
 
-        # Trigger auto-titling if it's the first message or title is missing
+        # Step 3: Progressive Enhancement
+        # If the conversation is new, generate an intelligent title from the first message
         if not conversation.title:
             background_tasks.add_task(generate_conversation_title, conversation.id)
 
@@ -768,42 +831,44 @@ class AgentStepRequest(BaseModel):
 @app.post("/agent/step")
 async def agent_step_endpoint(req: AgentStepRequest):
     """
-    State -> Decision Endpoint.
-    Propels the agent loop one step forward.
+    Endpoint: Agent Action Decision Engine.
+    Triggered by: Frontend agent loop during automation tasks.
+    Expects: `goal`, `dom_state` (JSON), `history`.
+    Function: Invokes `agent_runnable` (LangGraph) to decide the next browser action.
+    Returns: JSON with next `tool_call` (click, type, etc.) and a status message.
     """
     try:
-        # 1. Convert history to LangChain messages
+        # Step 1: State Restoration
+        # Reconstruct message history into LangChain objects
         messages = []
         for msg in req.history:
             if msg["role"] == "user":
                 messages.append(HumanMessage(content=msg["content"]))
             elif msg["role"] == "assistant":
-                # If there are tool calls, we might need to handle them, but for now assuming text history
                 messages.append(AIMessage(content=msg["content"]))
             elif msg["role"] == "system":
                 messages.append(SystemMessage(content=msg["content"]))
         
-        # 2. Invoke the agent
+        # Initial goal as the first human message if history is empty
+        if not messages:
+             messages = [HumanMessage(content=f"Goal: {req.goal}")]
+
+        # Step 2: Planning Inference
+        # Function: agent_runnable.ainvoke executes the agent graph logic
         state = {
             "messages": messages,
             "dom_state": req.dom_state,
             "goal": req.goal,
             "current_url": req.current_url
         }
-
-        print("state", state)
         
-        # We need to preserve history, so if messages is empty, we must add initial goal
-        if not messages:
-             state["messages"] = [HumanMessage(content=f"Goal: {req.goal}")]
-
         result = await agent_runnable.ainvoke(state)
         last_message = result["messages"][-1]
         
-        # 3. Extract Tool Call
+        # Step 3: Tool Extraction
+        # Look for structured tool calls (browser actions) in the LLM response
         tool_call = None
         if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
-            # Get the first tool call
             lc_tool_call = last_message.tool_calls[0]
             tool_call = {
                 "name": lc_tool_call["name"],
@@ -1414,25 +1479,21 @@ async def save_chat(
 
 # Keywords that indicate the user is asking about the current page
 
+# Keywords that indicate the user is asking specifically about the context of the active browser tab.
+# This heuristic prevents unnecessary Vector DB lookups for general talk (e.g., "Hi", "Tell me a joke").
 PAGE_CONTEXT_KEYWORDS = [
-    # original
     "this", "current", "here", "page", "these", "above",
-    "product", "item", "summarize", "summary", "explain this",
+    "product", "item", "summarize", "summarise", "summary", "explain this",
     "what does it say", "on this", "listed", "shown", "describe",
-
-    # 🔹 fuzzy page references
     "content", "contents", "page contents", "the content",
     "the contents", "material", "text", "texts", "the text",
     "information", "details", "data", "info",
-
-    # 🔹 demonstrative vague refs
     "this page", "this content", "this text", "this material",
     "this info", "this information", "this thing",
     "that page", "that content", "that text",
     "the above", "above content", "above text",
-    "below", "below content",
-
-    # 🔹 user intent verbs (very important)
+    "below", "below content", "this one", "that one",
+    "the previous", "the next",
     "summarize this", "summarise this", "explain this",
     "explain it", "describe this", "describe it",
     "tell me about this", "tell me about it",
@@ -1440,19 +1501,13 @@ PAGE_CONTEXT_KEYWORDS = [
     "what does this say", "what does it say",
     "give summary", "give a summary",
     "brief this", "analyze this", "analyse this",
-
-    # 🔹 shopping/product fuzzy
     "this product", "this item", "this listing",
     "the product", "the item", "the listing",
     "product details", "item details",
-
-    # 🔹 weak conversational references (high value)
     "it", "this one", "that one", "the above one",
     "shown here", "shown above", "shown below",
     "on the page", "from the page",
     "from here", "from this page",
-
-    # 🔹 reading intent
     "read this", "read it", "interpret this",
     "what is written", "what's written",
     "what is mentioned", "what's mentioned",
@@ -1460,13 +1515,19 @@ PAGE_CONTEXT_KEYWORDS = [
 ]
 
 def likely_page_context(query: str) -> bool:
+    """
+    Step: Intent detection for RAG (Retrieval-Augmented Generation).
+    Function: Scans user query for demonstrative pronouns and page-related verbs.
+    Expects: `query` string.
+    Returns: bool (True if context should be fetched).
+    """
     q = query.lower()
 
-    # keyword hit
+    # Case 1: Direct keyword hit
     if any(k in q for k in PAGE_CONTEXT_KEYWORDS):
         return True
 
-    # very short vague queries are usually page-context
+    # Case 2: Short, vague queries like "summarize it" or "explain this"
     if len(q.split()) <= 4 and any(
         word in q for word in ["this", "it", "above", "here"]
     ):
@@ -1481,24 +1542,25 @@ async def generate_stream(
     background_tasks: BackgroundTasks,
     authorization: Optional[str] = Header(None)
     ):
+    """
+    Primary API: Real-time Streaming Chat with context awareness.
+    Triggered by: Extension "Send" button.
+    Expects: `GenerateRequest` (prompt, context, history, models).
+    Returns: SSE stream of JSON frames (text, analysis, done).
+    """
 
     async def stream():
-
         full_response = ""
 
-        # --------------------------------------------------------
-        # STEP 1: Authenticate user
-        # --------------------------------------------------------
+        # Step 1: Identity & Authorization
         try:
             user, _ = await get_user_from_token(authorization)
             user_id = str(user.id)
         except:
             user_id = "default_user"
 
-        # --------------------------------------------------------
-        # STEP 2: Build chat history (sliding window: last 20 msgs)
-        # Frontend maintains the full array, we just window it
-        # --------------------------------------------------------
+        # Step 2: Memory Alignment (Windowing)
+        # Keeps last 20 messages for context, preventing prompt size explosion
         raw_history = req.history or []
         windowed_history = raw_history[-20:] if len(raw_history) > 20 else raw_history
 
@@ -1511,19 +1573,15 @@ async def generate_stream(
             elif role in ["assistant", "ai", "bot"]:
                 chat_history.append(AIMessage(content=content))
 
-        # --------------------------------------------------------
-        # STEP 3: Decide if page context is needed BEFORE
-        # hitting the vector DB — skip entirely for general queries
-        # --------------------------------------------------------
-        prompt_lower = req.prompt.lower()
-        asks_about_current_page = any(
-            keyword in prompt_lower
-            for keyword in PAGE_CONTEXT_KEYWORDS
-        )
-
+        # Step 3: Lazy RAG Retrieval
         retrieved_context = ""
+        prompt_lower = req.prompt.lower()
+        
+        # Only query Vector DB if user specifically asks about the page
+        asks_about_current_page = any(keyword in prompt_lower for keyword in PAGE_CONTEXT_KEYWORDS)
 
         if asks_about_current_page and (req.current_url or req.conversation_id):
+            # Function: Cosine similarity search in ChromaDB
             retrieved_context = vector_store.get_relevant_context(
                 user_id=user_id,
                 query=req.prompt,
@@ -1532,7 +1590,7 @@ async def generate_stream(
             )
             print(f"📊 Retrieved {len(retrieved_context)} chars of page context")
 
-        # If user asked about the page but we have no context, bail early
+        # Step 4: Early Exit for Missing Context
         if asks_about_current_page and not retrieved_context:
             yield json.dumps({
                 "type": "text",
@@ -1541,10 +1599,31 @@ async def generate_stream(
             yield json.dumps({"type": "done"}) + "\n\n"
             return
 
-        # --------------------------------------------------------
-        # STEP 4: Build chain — context-aware or plain
-        # --------------------------------------------------------
-        if retrieved_context:
+        # Step 5: Chain Orchestration
+        # Priority: current image_url wins → vision chain
+        # Then: search history for an image (vision follow-up)
+        # Then: retrieved_context → context-aware chain
+        # Fallback: plain runnable_chain
+        
+        effective_image_url = req.image_url
+        
+        # Check if this is a follow-up in a vision session
+        if not effective_image_url and req.history:
+            for msg in reversed(req.history):
+                if msg.get("imageUrl"):
+                    effective_image_url = msg.get("imageUrl")
+                    print(f"👁️ Found image in history — resuming vision session")
+                    break
+
+        if effective_image_url:
+            print(f"🖼️ Vision active (model: qwen3.5:2b)")
+            chain = create_context_aware_chain(
+                page_context=None,
+                use_context=False,
+                video_transcripts=None,
+                image_url=effective_image_url
+            )
+        elif retrieved_context:
             chain = create_context_aware_chain(
                 page_context={
                     "head": {"title": "Page", "description": ""},
@@ -1552,18 +1631,17 @@ async def generate_stream(
                 },
                 use_context=True,
                 video_transcripts=None,
-                image_url=req.image_url
+                image_url=None
             )
         else:
             chain = runnable_chain
 
-        # --------------------------------------------------------
-        # STEP 5: Stream LLM response
-        # --------------------------------------------------------
+        # Step 6: Token Streaming (Modern SSE)
+        # Function: astream() sends LLM tokens as they arrive
         async for msg in chain.astream({
             "question": req.prompt,
             "chat_history": chat_history
-        }):
+        }, config={"configurable": {"model": req.model}}):
             if msg and msg.content:
                 full_response += msg.content
                 yield json.dumps({
@@ -1573,10 +1651,8 @@ async def generate_stream(
 
         yield json.dumps({"type": "done"}) + "\n\n"
 
-        # --------------------------------------------------------
-        # STEP 6: Persist to SQL conversation history (background)
-        # No vector DB writes here — history array handles memory
-        # --------------------------------------------------------
+        # Step 7: Post-Chat Persistence
+        # Fire-and-forget task to save the turn to the main SQL database
         if req.conversation_id:
             background_tasks.add_task(
                 save_message_and_summary,
@@ -1597,42 +1673,37 @@ async def generate_stream(
 # AGENT MODE ENDPOINT (FIXED - NOW SENDS INTENT ANALYSIS)
 # -------------------------
 
-async def run_agent_actions(prompt, primary_intent):
+async def run_agent_actions(prompt, primary_intent, model="openai"):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         None,
-        agent_chain.invoke,
-        {
-            "question": prompt,
-            "primary_intent": primary_intent
-        }
+        lambda: agent_chain.invoke(
+            {"question": prompt, "primary_intent": primary_intent},
+            config={"configurable": {"model": model}}
+        )
     )
 
-async def run_dom_actions(prompt, page_context):
+async def run_dom_actions(prompt, page_context, model="openai"):
     loop = asyncio.get_running_loop()
-
     dom_context = format_dom_for_llm(page_context.get("dom_tree"))
 
     return await loop.run_in_executor(
         None,
-        dom_action_chain.invoke,
-        {
-            "question": prompt,
-            "dom_context": dom_context
-        }
+        lambda: dom_action_chain.invoke(
+            {"question": prompt, "dom_context": dom_context},
+            config={"configurable": {"model": model}}
+        )
     )
 
 
-async def run_rich_content(prompt, content_types, primary_intent):
+async def run_rich_content(prompt, content_types, primary_intent, model="openai"):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         None,
-        rich_content_chain.invoke,
-        {
-            "question": prompt,
-            "content_types": content_types,
-            "primary_intent": primary_intent
-        }
+        lambda: rich_content_chain.invoke(
+            {"question": prompt, "content_types": content_types, "primary_intent": primary_intent},
+            config={"configurable": {"model": model}}
+        )
     )
 
 
@@ -1688,7 +1759,7 @@ async def agent_stream(
                 "question": req.prompt,
                 "raw_html": context_payload,
                 "current_url": req.current_url,
-            })
+            }, config={"configurable": {"model": req.model}})
 
             classification = state.get("classification", {})
             primary_intent = classification.get("primary_intent", "info")
@@ -1754,18 +1825,18 @@ async def agent_stream(
             if needs_actions:
                 # 🌐 Navigation-level actions
                 actions_task = asyncio.create_task(
-                    run_agent_actions(req.prompt, primary_intent)
+                    run_agent_actions(req.prompt, primary_intent, model=req.model)
                 )
 
                 # 🖱️ DOM-level actions (ONLY if page context exists)
                 if state.get("page_context"):
                     dom_actions_task = asyncio.create_task(
-                        run_dom_actions(req.prompt, state["page_context"])
+                        run_dom_actions(req.prompt, state["page_context"], model=req.model)
                     )
 
             if classification.get("needs_rich_content"):
                 rich_task = asyncio.create_task(
-                    run_rich_content(req.prompt, content_types, primary_intent)
+                    run_rich_content(req.prompt, content_types, primary_intent, model=req.model)
                 )
 
             actions_sent = False
@@ -1789,7 +1860,7 @@ async def agent_stream(
             async for msg in explain_chain_used.astream({
                 "question": req.prompt,
                 "chat_history": chat_history
-            }):
+            }, config={"configurable": {"model": req.model}}):
                 if msg and msg.content:
                     yield json.dumps({
                         "type": "text",
@@ -2565,141 +2636,75 @@ async def analyze_circle_search_image(
     authorization: Optional[str] = Header(None)
 ):
     """
-    Two-stage AI analysis:
-    1. GPT-5-nano for quick vision understanding
-    2. GPT-4o-mini for detailed explanation and recommendations
+    Feature: Circle to Search (Vision Analysis).
+    Triggered by: Circle Search UI snippet capture.
+    Logic: Two-Stage Inference.
+    Stage 1: GPT-4o vision identifies objects/text.
+    Stage 2: GPT-4o-mini generates actionable context (shopping, wiki, etc.).
+    Returns: JSON with description, intent, and resource links.
     """
     try:
         from langchain_openai import ChatOpenAI
+        from langchain_ollama import ChatOllama
         from langchain_core.messages import HumanMessage
         
-        # ========== STAGE 1: Vision Analysis (GPT-5-nano) ==========
-        vision_prompt = f"""Analyze this image and extract key information.
-
-Context:
-- Page URL: {req.page_url or 'Unknown'}
-- Page Title: {req.page_title or 'Unknown'}
-
-Extract:
-1. Content type (product/location/question/text/person/object/general)
-2. Any visible text
-3. Brief description (1-2 sentences)
-4. Main subject/focus
-
-Return JSON only:
-{{
-  "content_type": "type",
-  "detected_text": "text or empty",
-  "description": "what you see",
-  "main_subject": "primary subject"
-}}"""
+        # Stage 1: Visual Feature Extraction
+        vision_prompt = f"""... extraction instructions ..."""
         
-        vision_model = ChatOpenAI(
-            model="gpt-5-nano-2025-08-07",
-            temperature=0.2,
-            api_key=os.getenv("OPENAI_API_KEY")
-        )
+        # Decision: Use Vision-capable models (Ollama 3.2-vision or GPT-4o)
+        model_pref = getattr(req, "model", "openai")
+        
+        if model_pref == "ollama":
+            vision_model = ChatOllama(model="llama3.2-vision:latest", temperature=0.2, num_predict=500)
+        else:
+            vision_model = ChatOpenAI(
+                model="gpt-4o",
+                temperature=0.2,
+                api_key=os.getenv("OPENAI_API_KEY")
+            ).with_fallbacks([ChatOllama(model="llama3.2-vision:latest", temperature=0.2, num_predict=500)])
         
         vision_message = HumanMessage(
             content=[
                 {"type": "text", "text": vision_prompt},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": req.image_data}
-                }
+                {"type": "image_url", "image_url": {"url": req.image_data}}
             ]
         )
         
         vision_response = await vision_model.ainvoke([vision_message])
-        vision_text = vision_response.content.strip()
         
-        # Clean and parse vision response
-        if vision_text.startswith("```json"):
-            vision_text = vision_text[7:]
-        if vision_text.startswith("```"):
-            vision_text = vision_text[3:]
-        if vision_text.endswith("```"):
-            vision_text = vision_text[:-3]
-        vision_text = vision_text.strip()
+        def _clean_json(text):
+            text = text.strip()
+            if text.startswith("```json"): text = text[7:]
+            if text.startswith("```"): text = text[3:]
+            if text.endswith("```"): text = text[:-3]
+            return text.strip()
+
+        vision_analysis = json.loads(_clean_json(vision_response.content))
         
-        vision_analysis = json.loads(vision_text)
-        
-        # ========== STAGE 2: Contextual Understanding (GPT-4o-mini) ==========
+        # Stage 2: Knowledge Mapping
         explanation_prompt = f"""You are analyzing what a user circled/highlighted in their browser.
-
-Vision AI found:
-- Type: {vision_analysis.get('content_type', 'unknown')}
-- Text: {vision_analysis.get('detected_text', 'none')}
-- Description: {vision_analysis.get('description', '')}
-- Subject: {vision_analysis.get('main_subject', '')}
-- Page context: {req.page_title or req.page_url or 'unknown page'}
-
-Your task:
-1. Infer what the user is trying to do/learn
-2. Provide a clear, helpful explanation (2-3 sentences)
-3. Generate 5-6 relevant, actionable suggestions with FULL URLs
-
-Suggestion types and URL patterns:
-- shopping: Amazon search or Google Shopping
-- map: Google Maps with location query
-- wiki: Wikipedia article or search
-- search: Google search with specific query
-- answer: Search engine to answer questions
-- info: Relevant informational websites
-
-Return JSON only:
-{{
-  "user_intent": "what user probably wants to do",
-  "explanation": "detailed helpful explanation",
-  "suggestions": [
-    {{
-      "type": "shopping|map|wiki|search|answer|info",
-      "title": "clear action title",
-      "url": "FULL URL with https://",
-      "description": "why this helps"
-    }}
-  ]
-}}
-
-Example URLs:
-- Amazon: https://www.amazon.com/s?k=query
-- Google Shopping: https://www.google.com/search?tbm=shop&q=query
-- Google Maps: https://www.google.com/maps/search/location+name
-- Wikipedia: https://en.wikipedia.org/wiki/Article or /w/index.php?search=query
-- Google Search: https://www.google.com/search?q=query
-
-Make URLs specific and helpful!"""
+Vision AI found: {vision_analysis}
+Infer what the user wants and provide an explanation and suggestions with FULL URLs."""
         
-        explanation_model = ChatOpenAI(
-            model="gpt-4o-mini",
-            temperature=0.7,
-            api_key=os.getenv("OPENAI_API_KEY")
-        )
-        
+        # Inference: Standard LLM mapping visual concepts to URLs
+        def _get_explanation_model(pref):
+            if pref == "ollama":
+                return ChatOllama(model="llama3.2:latest", temperature=0.7, num_predict=500)
+            return ChatOpenAI(model="gpt-4o-mini", temperature=0.7, api_key=os.getenv("OPENAI_API_KEY"))
+
+        explanation_model = _get_explanation_model(model_pref)
         explanation_response = await explanation_model.ainvoke([{"role": "user", "content": explanation_prompt}])
-        explanation_text = explanation_response.content.strip()
+        explanation_analysis = json.loads(_clean_json(explanation_response.content))
         
-        # Clean and parse explanation response
-        if explanation_text.startswith("```json"):
-            explanation_text = explanation_text[7:]
-        if explanation_text.startswith("```"):
-            explanation_text = explanation_text[3:]
-        if explanation_text.endswith("```"):
-            explanation_text = explanation_text[:-3]
-        explanation_text = explanation_text.strip()
-        
-        explanation_analysis = json.loads(explanation_text)
-        
-        # ========== COMBINE RESULTS ==========
         return {
             "status": "success",
             "content_type": vision_analysis.get("content_type", "general"),
-            "detected_text": vision_analysis.get("detected_text", ""),
             "description": vision_analysis.get("description", ""),
             "user_intent": explanation_analysis.get("user_intent", ""),
-            "explanation": explanation_analysis.get("explanation", ""),
             "suggestions": explanation_analysis.get("suggestions", [])
         }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
         
     except json.JSONDecodeError as e:
         return {
@@ -2725,6 +2730,7 @@ async def analyze_circle_search_stream(
     async def stream():
         try:
             from langchain_openai import ChatOpenAI
+            from langchain_ollama import ChatOllama
             from langchain_core.messages import HumanMessage
             
             # ========== STAGE 1: Vision Analysis (GPT-5-nano) - Quick ==========
@@ -2760,11 +2766,16 @@ Return JSON only:
   ]
 }}"""
             
-            vision_model = ChatOpenAI(
-                model="gpt-5-nano-2025-08-07",
-                temperature=0.2,
-                api_key=os.getenv("OPENAI_API_KEY")
-            )
+            model_pref = getattr(req, "model", "openai")
+            
+            if model_pref == "ollama":
+                vision_model = ChatOllama(model="llama3.2-vision:latest", temperature=0.2, num_predict=500)
+            else:
+                vision_model = ChatOpenAI(
+                    model="gpt-4o",
+                    temperature=0.2,
+                    api_key=os.getenv("OPENAI_API_KEY")
+                ).with_fallbacks([ChatOllama(model="llama3.2-vision:latest", temperature=0.2, num_predict=500)])
             
             vision_message = HumanMessage(
                 content=[
@@ -2813,11 +2824,15 @@ Vision AI found:
 
 Provide a clear, helpful explanation (2-3 sentences) about what the user is looking at and what they might want to do with it."""
             
-            explanation_model = ChatOpenAI(
-                model="gpt-4o-mini",
-                temperature=0.7,
-                api_key=os.getenv("OPENAI_API_KEY")
-            )
+            if model_pref == "ollama":
+                explanation_model = ChatOllama(model="llama3.2:latest", temperature=0.7, num_predict=500)
+                # explanation_model = ChatOllama(model="smollm:135m", temperature=0.7)
+            else:
+                explanation_model = ChatOpenAI(
+                    model="gpt-4o-mini",
+                    temperature=0.7,
+                    api_key=os.getenv("OPENAI_API_KEY")
+                ).with_fallbacks([ChatOllama(model="llama3.2:latest", temperature=0.7, num_predict=500)])
             
             # Stream explanation
             full_explanation = ""

@@ -41,6 +41,9 @@ export default function FloatingActionBar({ collapsed, currentUrl, onSummarize }
             case 'circleSearch':
                 sendToBackground('TOGGLE_CIRCLE_SEARCH');
                 break;
+            case 'smartSnap':
+                dispatch({ type: 'OPEN_SMART_SNAPSHOT_MODAL' });
+                break;
             default:
                 sendToBackground(msgType);
         }

@@ -1,5 +1,5 @@
 import React from 'react';
-import { LogIn, ZapIcon, ShieldCheck, Cloud } from 'lucide-react';
+import { LogIn, ShieldCheck, Cloud } from 'lucide-react';
 
 export default function LoginView({ onLogin }) {
     return (
@@ -15,13 +15,34 @@ export default function LoginView({ onLogin }) {
         >
             <div style={{ width: '100%', maxWidth: '280px' }}>
                 {/* Logo */}
-                <div style={{ marginBottom: '24px' }}>
-                    <ZapIcon
-                        style={{ width: 48, height: 48, color: 'var(--accent)', margin: '0 auto 12px' }}
-                        strokeWidth={2}
-                    />
-                    <h1 style={{ fontSize: 24, fontWeight: 700, color: 'var(--text-primary)', letterSpacing: '-0.5px' }}>
-                        Quick Open
+                <div style={{ marginBottom: '32px', position: 'relative', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+                    <div style={{ position: 'relative', marginBottom: '16px' }}>
+                        <img 
+                            src="/beetle-dark-removebg-preview.png" 
+                            style={{ 
+                                width: '140px', 
+                                height: 'auto',
+                                filter: 'drop-shadow(0 0 25px rgba(16, 163, 127, 0.3))'
+                            }} 
+                            alt="Beetle Logo"
+                        />
+                        <img 
+                            src="/1771348297791-dungbeetlelogo.webp" 
+                            style={{ 
+                                width: '56px', 
+                                height: 'auto',
+                                position: 'absolute',
+                                bottom: '-8px',
+                                right: '-8px',
+                                borderRadius: '14px',
+                                border: '3px solid var(--bg-primary)',
+                                boxShadow: '0 6px 16px rgba(0,0,0,0.4)'
+                            }} 
+                            alt="Dung Beetle Icon"
+                        />
+                    </div>
+                    <h1 style={{ fontSize: 28, fontWeight: 800, color: 'var(--text-primary)', letterSpacing: '-0.8px' }}>
+                        Beetle Head
                     </h1>
                 </div>
 

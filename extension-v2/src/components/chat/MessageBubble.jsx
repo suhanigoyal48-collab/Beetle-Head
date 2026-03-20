@@ -8,7 +8,7 @@ marked.setOptions({ breaks: true, gfm: true });
 
 export default function MessageBubble({ message, onSendMessage }) {
     const { role, content, html, isStreaming, isError, contextAnalysis,
-        videoAnalysis, richBlocks, agentActions, isAgent } = message;
+        videoAnalysis, richBlocks, agentActions, isAgent, screenshot, video } = message;
 
     if (role === 'user') {
         return (
@@ -84,6 +84,42 @@ export default function MessageBubble({ message, onSendMessage }) {
 
             {/* Typing indicator while streaming, no text yet */}
             {isStreaming && !content && <TypingIndicator />}
+
+            {/* Media content */}
+            {screenshot && (
+                <div style={{
+                    marginTop: 8,
+                    borderRadius: 12,
+                    overflow: 'hidden',
+                    border: '1px solid var(--border)',
+                    background: 'var(--bg-secondary)',
+                    width: '100%',
+                }}>
+                    <img
+                        src={screenshot}
+                        alt="Captured Screen"
+                        style={{ width: '100%', height: 'auto', display: 'block', cursor: 'pointer' }}
+                        onClick={() => window.open(screenshot, '_blank')}
+                    />
+                </div>
+            )}
+
+            {video && (
+                <div style={{
+                    marginTop: 8,
+                    borderRadius: 12,
+                    overflow: 'hidden',
+                    border: '1px solid var(--border)',
+                    background: 'var(--bg-secondary)',
+                    width: '100%',
+                }}>
+                    <video
+                        src={video}
+                        controls
+                        style={{ width: '100%', height: 'auto', display: 'block', maxHeight: 300 }}
+                    />
+                </div>
+            )}
 
             {/* Agent actions */}
             {agentActions && agentActions.length > 0 && (

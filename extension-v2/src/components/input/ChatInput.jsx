@@ -38,7 +38,7 @@ export default function ChatInput({ currentUrl }) {
 
         // Build user message content
         const userContent = attachedImageUrl ? (text ? `${text}\n\n[Image Attached]` : '[Image Attached]') : text;
-        addMessage('user', userContent);
+        addMessage('user', userContent, { imageUrl: attachedImageUrl });
 
         if (inputRef.current) {
             inputRef.current.value = '';
@@ -130,44 +130,7 @@ export default function ChatInput({ currentUrl }) {
                 position: 'relative',
             }}
         >
-            {/* Image preview */}
-            {attachedImageUrl && (
-                <div
-                    id="inputPreviewArea"
-                    style={{
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: 12,
-                        padding: '8px 12px',
-                        background: 'var(--bg-secondary)',
-                        borderRadius: 10,
-                        marginBottom: 8,
-                        border: '1px solid var(--border)',
-                        position: 'relative',
-                        overflow: 'hidden',
-                    }}
-                >
-                    <div className="preview-image-container">
-                        <img id="previewImage" src={attachedImageUrl} alt="Preview" />
-                    </div>
-                    <div style={{ flex: 1, fontSize: 12, color: 'var(--text-secondary)' }} id="previewLabel">
-                        {previewLabel || 'Image attached — Type your query below'}
-                    </div>
-                    <button
-                        id="previewRemoveBtn"
-                        onClick={clearPreview}
-                        style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)', padding: 4 }}
-                    >
-                        <X size={16} />
-                    </button>
-                    {/* Upload progress bar */}
-                    {isUploading && (
-                        <div className="upload-progress-container">
-                            <div className="upload-progress-bar" style={{ width: `${uploadProgress}%` }} />
-                        </div>
-                    )}
-                </div>
-            )}
+
 
             <div
                 style={{
@@ -185,7 +148,10 @@ export default function ChatInput({ currentUrl }) {
                 <div style={{ position: 'relative' }}>
                     <button
                         id="plusMenuBtn"
-                        onClick={() => dispatch({ type: 'TOGGLE_PLUS_MENU' })}
+                        onClick={(e) => {
+                            e.stopPropagation();
+                            dispatch({ type: 'TOGGLE_PLUS_MENU' });
+                        }}
                         title="More options"
                         style={{
                             background: 'none',
@@ -229,7 +195,7 @@ export default function ChatInput({ currentUrl }) {
                             <PlusMenuItem icon={<MessageSquarePlus size={15} />} label="New Chat" onClick={handleNewChat} />
                             <PlusMenuItem
                                 icon={<Upload size={15} />}
-                                label="Upload File"
+                                label="Upload Image"
                                 onClick={() => { fileInputRef.current?.click(); dispatch({ type: 'CLOSE_PLUS_MENU' }); }}
                             />
                             <PlusMenuItem
@@ -237,10 +203,48 @@ export default function ChatInput({ currentUrl }) {
                                 label="Take Screenshot"
                                 onClick={() => { dispatch({ type: 'OPEN_SCREENSHOT_MODAL' }); dispatch({ type: 'CLOSE_PLUS_MENU' }); }}
                             />
-                            <input ref={fileInputRef} type="file" style={{ display: 'none' }} onChange={handleFileUpload} />
                         </div>
                     )}
                 </div>
+
+                {/* Hidden File Input */}
+                <input ref={fileInputRef} type="file" accept="image/*" style={{ display: 'none' }} onChange={handleFileUpload} />
+
+                {/* Internal Image Thumbnail */}
+                {attachedImageUrl && (
+                    <div style={{
+                        position: 'relative',
+                        width: 40,
+                        height: 40,
+                        borderRadius: 8,
+                        overflow: 'hidden',
+                        border: '1px solid var(--border)',
+                        flexShrink: 0
+                    }}>
+                        <img 
+                            src={attachedImageUrl} 
+                            style={{ width: '100%', height: '100%', objectFit: 'cover' }} 
+                            alt="Preview" 
+                        />
+                        <button
+                            onClick={clearPreview}
+                            style={{
+                                position: 'absolute',
+                                top: 2,
+                                right: 2,
+                                background: 'rgba(0,0,0,0.5)',
+                                border: 'none',
+                                borderRadius: '50%',
+                                padding: 2,
+                                cursor: 'pointer',
+                                color: 'white',
+                                display: 'flex'
+                            }}
+                        >
+                            <X size={12} />
+                        </button>
+                    </div>
+                )}
 
                 {/* Textarea */}
                 <textarea

@@ -7,10 +7,19 @@ from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
 # ======================================================
-# STATE
+# STATE DEFINITION
 # ======================================================
 
 class AgentState(TypedDict):
+    """
+    Defines the state managed by the LangGraph agent.
+    
+    Attributes:
+        messages: A list of messages in the conversation, using operator.add for accumulation.
+        dom_state: A dictionary representing the current state of the DOM (interactive elements).
+        goal: The user's research goal or task description.
+        current_url: The URL of the page the agent is currently viewing.
+    """
     messages: Annotated[List[BaseMessage], operator.add]
     dom_state: dict
     goal: str
@@ -21,94 +30,134 @@ class AgentState(TypedDict):
 # ======================================================
 
 class SearchGoogle(BaseModel):
-    query: str = Field(description="Search query to look up on Google.")
+    """Schema for the search_google tool."""
+    query: str = Field(description="Search query to look up on Google. Triggers a Google search in the browser.")
 
 class SearchYoutube(BaseModel):
-    query: str = Field(description="Search query to find videos on YouTube.")
+    """Schema for the search_youtube tool."""
+    query: str = Field(description="Search query to find videos on YouTube. Triggers a YouTube search.")
 
 class OpenUrlsInBackground(BaseModel):
+    """Schema for the open_urls_in_background tool."""
     urls: List[str] = Field(description="2-4 URLs to open, read, and summarize before deciding where to go.")
-    reason: str = Field(description="Why these URLs are relevant.")
+    reason: str = Field(description="Why these URLs are relevant to the user's goal.")
 
 class NavigateTo(BaseModel):
+    """Schema for the navigate_to tool."""
     url: str = Field(description="URL to navigate to in the active tab.")
     reason: str = Field(description="Why navigating here advances the goal.")
 
 class ClickElement(BaseModel):
-    selector: str = Field(description="CSS selector or ID of the element to click.")
-    reason: str = Field(description="Why clicking this advances the goal.")
+    """Schema for the click_element tool."""
+    selector: str = Field(description="CSS selector or ID of the element to click. Triggers a click event.")
+    reason: str = Field(description="Why clicking this element advances the goal.")
 
 class TypeText(BaseModel):
-    selector: str = Field(description="CSS selector or ID of the input field.")
-    text: str = Field(description="Text to type.")
-    reason: str = Field(description="Why typing this advances the goal.")
+    """Schema for the type_text tool."""
+    selector: str = Field(description="CSS selector or ID of the input field. Triggers a typing event.")
+    text: str = Field(description="Text to type into the field.")
+    reason: str = Field(description="Why typing this text advances the goal.")
 
 class Scroll(BaseModel):
-    direction: str = Field(description="'up' or 'down'")
-    amount: str = Field(description="e.g. '500px' or 'page'")
+    """Schema for the scroll tool."""
+    direction: str = Field(description="'up' or 'down' direction for scrolling.")
+    amount: str = Field(description="Amount to scroll, e.g. '500px', 'page', or 'half'.")
 
 class ReadPageContent(BaseModel):
-    reason: str = Field(description="Why you need to read this page.")
+    """Schema for the read_page_content tool."""
+    reason: str = Field(description="Why you need to read the full content of this page.")
 
 class Done(BaseModel):
-    success: bool = Field(description="Whether the goal was achieved.")
-    summary: str = Field(description="Markdown summary of everything researched, with URLs as links.")
+    """Schema for the done tool."""
+    success: bool = Field(description="Whether the user's goal was successfully achieved.")
+    summary: str = Field(description="Markdown summary of the research findings, including URLs as clickable links.")
 
 # ======================================================
-# TOOLS
+# TOOL DEFINITIONS (STUBS/LOGGING)
 # ======================================================
 
 @tool("search_google", args_schema=SearchGoogle)
 def search_google_tool(query: str):
-    """Navigate to Google and search for a query. Use this to start web research."""
+    """
+    Navigate to Google and search for a query.
+    Expected: A search query string.
+    Triggers: Browser navigation to google.com with the search query.
+    """
     return "search_google"
 
 @tool("search_youtube", args_schema=SearchYoutube)
 def search_youtube_tool(query: str):
-    """Search YouTube for videos related to the query. Opens YouTube search results."""
+    """
+    Search YouTube for videos related to the query.
+    Expected: A search query string.
+    Triggers: Browser navigation to youtube.com with the search results.
+    """
     return "search_youtube"
 
 @tool("open_urls_in_background", args_schema=OpenUrlsInBackground)
 def open_urls_in_background_tool(urls: List[str], reason: str):
-    """Open 2-4 URLs in background tabs, read their content, return summaries. Use after seeing search results."""
+    """
+    Open multiple URLs in background tabs to extract content.
+    Expected: A list of 2-4 URLs and a reason.
+    Triggers: Sequential background page loading and content extraction.
+    """
     return "open_urls_in_background"
 
 @tool("navigate_to", args_schema=NavigateTo)
 def navigate_to_tool(url: str, reason: str):
-    """Navigate the active tab to a URL."""
+    """
+    Navigate the active tab to a specific URL.
+    Expected: A valid URL string.
+    Triggers: Active tab navigation change.
+    """
     return "navigate_to"
 
 @tool("click_element", args_schema=ClickElement)
 def click_element_tool(selector: str, reason: str):
-    """Click an element. Only use when clearly needed."""
+    """
+    Click an interactive element on the current page.
+    Expected: A valid CSS selector or data-ai-id.
+    Triggers: Mouse click event on the target element.
+    """
     return "click_element"
 
 @tool("type_text", args_schema=TypeText)
 def type_text_tool(selector: str, text: str, reason: str):
-    """Type into an input field."""
+    """
+    Type text into an input field on the page.
+    Expected: A selector for the input and the text to type.
+    Triggers: Focus and keyboard events on the target element.
+    """
     return "type_text"
 
 @tool("scroll", args_schema=Scroll)
 def scroll_tool(direction: str, amount: str):
-    """Scroll only if content is cut off."""
+    """
+    Scroll the current page to reveal more content.
+    Expected: Direction ('up'/'down') and amount.
+    Triggers: Scroll event on the active page.
+    """
     return "scroll"
 
 @tool("read_page_content", args_schema=ReadPageContent)
 def read_page_content_tool(reason: str):
-    """Read the visible text of the current page."""
+    """
+    Read the visible text and structure of the current page.
+    Expected: A reason for reading.
+    Triggers: DOM analysis and text extraction.
+    """
     return "read_page_content"
 
 @tool("done", args_schema=Done)
 def done_tool(success: bool, summary: str):
     """
-    Call when the goal is satisfied.
-    Write a Markdown summary that includes:
-    - What you found
-    - All pages visited as clickable links [Title](URL)
-    - YouTube results if any
+    Signal that the goal has been achieved and provide a final report.
+    Expected: Success flag and a markdown-formatted summary.
+    Triggers: Termination of the agent loop and delivery of the final response to the user.
     """
     return "done"
 
+# List of tools available to the agent
 tools = [
     search_google_tool,
     search_youtube_tool,
@@ -122,14 +171,15 @@ tools = [
 ]
 
 # ======================================================
-# LLM
+# LLM CONFIGURATION
 # ======================================================
 
+# Initialize the OpenAI model with tools bound for agentic behavior
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 llm_with_tools = llm.bind_tools(tools, tool_choice="any")
 
 # ======================================================
-# PROMPTS
+# SYSTEM & STEP PROMPTS
 # ======================================================
 
 SYSTEM_PROMPT = """You are a browser automation agent. Goal: "{goal}"
@@ -165,16 +215,27 @@ Current page state:
 What is the single best NEXT action to move closer to the goal?"""
 
 # ======================================================
-# AGENT NODE
+# AGENT WORKFLOW NODE
 # ======================================================
 
 def agent_node(state: AgentState):
+    """
+    The primary execution node for the agent in the LangGraph.
+    
+    This function:
+    1. Extracts history, DOM state, and the goal from the state.
+    2. Constructs a full prompt including the System Message, chat history, and the current step request.
+    3. Invokes the LLM with tool-calling capabilities.
+    4. Returns the LLM's response to be added to the state messages.
+    
+    Triggers: LLM generation for tool selection or final output.
+    """
     history = state["messages"]
     dom_state = state["dom_state"]
     goal = state["goal"]
 
-    # Always: [rules + context] → [what happened] → [current page + decision request]
-    # This ensures the LLM sees its rules AND its action history on every step.
+    # Always: [rules + context] → [previous interactions] → [current page + decision request]
+    # This ensures the LLM sees its operating rules AND its action history on every step.
     system_msg = SystemMessage(content=SYSTEM_PROMPT.format(goal=goal, dom_state=dom_state))
     step_msg = HumanMessage(content=STEP_PROMPT.format(goal=goal, dom_state=dom_state))
 
@@ -184,12 +245,14 @@ def agent_node(state: AgentState):
     return {"messages": [response]}
 
 # ======================================================
-# GRAPH
+# GRAPH DEFINITION & COMPILATION
 # ======================================================
 
+# Define a simple StateGraph with one 'agent' node that loops back until 'done' is called or END is reached.
 graph = StateGraph(AgentState)
 graph.add_node("agent", agent_node)
 graph.set_entry_point("agent")
 graph.add_edge("agent", END)
 
+# Compile the graph into a runnable instance
 agent_runnable = graph.compile()

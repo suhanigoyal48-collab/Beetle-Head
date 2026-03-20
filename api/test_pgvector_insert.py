@@ -3,6 +3,10 @@ from sqlalchemy.orm import sessionmaker
 from db.database import engine
 from db.models.vector_rag import PageChunk
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 # Create session
 Session = sessionmaker(bind=engine)
 

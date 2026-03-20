@@ -698,6 +698,25 @@ async def capture_page(url: str, output_path: str, format: Literal["pdf", "png"]
                     pass
         
         if format == "png":
+            # 🆕 Rolling screenshot logic: scroll to bottom slowly
+            await page.evaluate("""
+                async () => {
+                    await new Promise((resolve) => {
+                        let totalHeight = 0;
+                        let distance = 100;
+                        let timer = setInterval(() => {
+                            let scrollHeight = document.body.scrollHeight;
+                            window.scrollBy(0, distance);
+                            totalHeight += distance;
+                            if(totalHeight >= scrollHeight){
+                                clearInterval(timer);
+                                resolve();
+                            }
+                        }, 100);
+                    });
+                }
+            """)
+            await page.wait_for_timeout(1000) # Wait for final renders
             await page.screenshot(path=output_path, full_page=True)
         elif format == "pdf":
             if html:

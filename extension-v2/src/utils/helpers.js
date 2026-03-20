@@ -126,8 +126,22 @@ export function hasContextKeywords(query) {
         'article', 'this video', 'what is this', 'explain this',
         'about this', 'about it', 'tell me about'
     ];
-    const lower = query.toLowerCase();
     return keywords.some(k => lower.includes(k));
 }
 
-
+export function downloadJSON(data, filename) {
+    try {
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename || `dom-extraction-${Date.now()}.json`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        console.log(`[Download] Triggered download for: ${a.download}`);
+    } catch (e) {
+        console.error('[Download] Failed to trigger JSON download:', e);
+    }
+}

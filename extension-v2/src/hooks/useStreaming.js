@@ -2,6 +2,8 @@ import { useCallback } from 'react';
 import { useApp } from '../store/AppContext';
 import { API } from '../constants/api';
 import { marked } from 'marked';
+import { isRestrictedPage, downloadJSON } from '../utils/helpers';
+import { extractDOMTree } from '../utils/domExtractor';
 
 marked.setOptions({ breaks: true, gfm: true });
 
@@ -48,6 +50,67 @@ export function useStreaming() {
 
         const conversationId = await ensureConversationId();
 
+        // ─── Resolve effective URL at call time ─────────────────────────────────
+        // state.activeUrl starts as null until the first tab event fires.
+        // Always detect the live active tab so we don't miss context on first use.
+        let effectiveUrl = currentUrl;  // may be null if called without it
+        let activeTab = null;
+        let pageContext = null;
+
+        try {
+            if (typeof chrome !== 'undefined' && chrome.tabs) {
+                const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+                if (tab) {
+                    activeTab = tab;
+                    // If effectiveUrl was null (e.g. activeUrl not set yet) use the live tab URL
+                    if (!effectiveUrl && tab.url && !isRestrictedPage(tab.url)) {
+                        effectiveUrl = tab.url;
+                        // Keep state in sync so subsequent calls have it
+                        dispatch({ type: 'SET_BROWSER_FOCUSED_TAB', tabId: tab.id, url: tab.url });
+                    }
+                }
+            }
+        } catch (e) {
+            console.warn('[Context] Tab detection failed:', e);
+        }
+
+        // ─── Sync context save BEFORE chat request ──────────────────────────────
+        // Await the save so vector store has chunks ready before the chat request,
+        // and use the now-known conversationId so chunks are properly linked (Bug 2+3).
+        try {
+            if (activeTab && effectiveUrl && !isRestrictedPage(effectiveUrl) && chrome.scripting) {
+                const results = await chrome.scripting.executeScript({
+                    target: { tabId: activeTab.id },
+                    func: extractDOMTree
+                });
+                pageContext = results?.[0]?.result;
+
+                if (pageContext) {
+                    // Download the extracted JSON
+                    // downloadJSON(pageContext, `chat-context-${Date.now()}.json`);
+                }
+
+                if (pageContext && conversationId) {
+                    const token = state.accessToken;
+                    await fetch(API.CONTEXT, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${token}`
+                        },
+                        body: JSON.stringify({
+                            url: effectiveUrl,
+                            raw_html: pageContext,
+                            conversation_id: conversationId
+                        })
+                    });
+                    console.log('[Context] Synced page context before chat request for:', effectiveUrl);
+                }
+            }
+        } catch (e) {
+            console.warn('[Context] Pre-chat context sync failed:', e);
+        }
+
         let fullText = '';
 
         try {
@@ -58,11 +121,14 @@ export function useStreaming() {
                 body: JSON.stringify({
                     prompt: text,
                     imageUrl,
-                    currentUrl,
+                    currentUrl: effectiveUrl,           // use live-resolved URL, not null state.activeUrl
+                    context: pageContext,               // raw DOM fallback for backend
                     conversationId,
+                    model: state.preferredModel,
                     history: state.messages.map(m => ({
                         role: m.role === 'bot' ? 'assistant' : m.role,
-                        content: m.content
+                        content: m.content,
+                        imageUrl: m.imageUrl || (m.screenshot ? m.screenshot : null)
                     }))
                 }),
                 signal: controller.signal

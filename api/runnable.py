@@ -7,6 +7,7 @@ from pathlib import Path
 import assemblyai as aai
 import time
 from langchain_openai import ChatOpenAI
+from langchain_ollama import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
@@ -21,6 +22,29 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ASSEMBLYAI_API_KEY=os.getenv("ASSEMBLYAI_API_KEY")
 aai.settings.api_key = ASSEMBLYAI_API_KEY
+
+# FALLBACK MODELS (Ollama)
+ollama_llm = ChatOllama(model="llama3.2:latest", num_predict=500)
+ollama_json_llm = ChatOllama(model="llama3.2:latest", format="json", num_predict=500)
+
+from langchain_core.runnables import RunnableConfig
+
+def get_dynamic_llm(openai_llm, ollama_llm_instance):
+    """
+    Returns a Runnable that dynamically chooses between OpenAI and Ollama 
+    based on config['configurable']['model'] selection from the frontend.
+    """
+    def route_llm(input, config: RunnableConfig):
+        # Look for 'model' preference in config
+        model_pref = config.get("configurable", {}).get("model", "openai")
+        
+        if model_pref == "ollama":
+            return ollama_llm_instance
+        
+        # Default: OpenAI with Ollama as fallback
+        return openai_llm.with_fallbacks([ollama_llm_instance])
+    
+    return RunnableLambda(route_llm)
 
 # FASTEST config (accuracy sacrificed for speed)
 assembly_config = aai.TranscriptionConfig(
@@ -188,16 +212,14 @@ def transcribe_parallel(chunks):
     return " ".join(r for r in results if r)
 def get_youtube_transcript(url):
     """
-    Complete pipeline: Download YouTube audio and transcribe it
-    This is now SYNCHRONOUS (not async)
-    
-    Args:
-        url: YouTube video URL
-    
-    Returns:
-        dict with transcript and metadata
+    Core Pipeline: Converts YouTube URL to text transcript.
+    Step 1: Try capturing metadata/captions from YouTube API (fastest).
+    Step 2: Fallback to downloading audio via yt-dlp.
+    Step 3: Transcribe local audio using AssemblyAI with parallel chunk processing.
+    Expects: `url` string.
+    Returns: dict with `transcript`, `source`, and `url`.
     """
-    # 1. Try captions first (FASTEST)
+    # Logic Step: Captions check (Native subtitles)
     captions = get_youtube_captions_fast(url)
     if captions:
         return {
@@ -206,21 +228,20 @@ def get_youtube_transcript(url):
             "url": url
         }
 
-    # 2. Download audio
+    # Logic Step: Audio transcription fallback
     audio = download_youtube_audio(url)
     if not audio:
         return {"error": "audio download failed", "url": url}
 
-    # 3. Chunk + parallel STT
+    # Function: Assemblies transcribed audio into final text
     chunks = split_audio(audio)
     if not chunks:
         cleanup_files([audio])
         return {"error": "audio splitting failed", "url": url}
     
-    # transcript = transcribe_parallel(chunks)
     transcript=transcribe_chunk(audio)
 
-    # 4. Cleanup EVERYTHING
+    # Cleanup temporary storage
     cleanup_files(chunks + [audio])
 
     return {
@@ -293,11 +314,14 @@ User query: {question}
 Page has videos: {has_videos}
 """)
 
-video_context_analyzer_llm = ChatOpenAI(
-    model="gpt-4o-mini",
-    temperature=0.2,
-    streaming=False,
-    api_key=OPENAI_API_KEY
+video_context_analyzer_llm = get_dynamic_llm(
+    ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=0.2,
+        streaming=False,
+        api_key=OPENAI_API_KEY
+    ),
+    ollama_json_llm
 )
 
 video_context_analyzer_chain = (
@@ -342,11 +366,14 @@ Return ONLY this JSON:
 User query: {question}
 """)
 
-context_analyzer_llm = ChatOpenAI(
-    model="gpt-4o-mini",
-    temperature=0,
-    streaming=False,
-    api_key=OPENAI_API_KEY
+context_analyzer_llm = get_dynamic_llm(
+    ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=0,
+        streaming=False,
+        api_key=OPENAI_API_KEY
+    ),
+    ollama_json_llm
 )
 
 context_analyzer_chain = context_analyzer_prompt | context_analyzer_llm | JsonOutputParser()
@@ -355,17 +382,34 @@ context_analyzer_chain = context_analyzer_prompt | context_analyzer_llm | JsonOu
 # CONTEXT-AWARE CHAT WITH VIDEO SUPPORT
 # ======================================================
 
+# ======================================================
+# CONTEXT-AWARE CHAT PROMPT - Primary system instruction for RAG
+# ======================================================
 context_aware_chat_prompt = ChatPromptTemplate.from_messages([
-    ("system", "You are a helpful AI assistant.\n\n{context_section}\n\n{video_context_section}\n\nSTRICT OUTPUT FORMATTING RULES (MANDATORY):\n- Use VALID Markdown\n- Use ## for question headings\n- Use ### for sub-sections\n- Use bullet points for steps\n- Use numbered lists for answers\n- ALWAYS put equations in LaTeX blocks:\n\n  \\[\n  \\frac{{a}}{{b}}\n  \\]\n\n- NEVER write math like: ( \\frac{{1}}{{2}} )\n- NEVER wrap LaTeX in parentheses\n- Leave ONE blank line before and after headings\n- Do NOT dump raw text blocks\n- Keep answers readable and structured\n\nIf page context is provided:\n- Use ONLY the given page content\n- Do NOT assume anything not present\n- For quizzes or assignments, read questions carefully\n- Explain answers step by step when asked\n\nIf video transcript is provided:\n- Reference the video content accurately\n- You can quote or paraphrase from the transcript\n- Explain video topics clearly\n- Answer questions based on what was said in the video\n\nBe accurate, structured, and cleanly formatted."),
+    ("system", """You are a helpful AI assistant.
+Answer based on {context_section} and {video_context_section}.
+
+STRICT FORMATTING:
+- Use Markdown headers (##)
+- Always use LaTeX blocks for math: \\[ \\]
+- Use bullet points for structured data.
+
+Logic:
+1. Use page content ONLY if provided.
+2. If video transcript exists, prioritize spoken facts.
+3. Be professional and structured."""),
     MessagesPlaceholder(variable_name="chat_history"),
     ("human", "{question}")
 ])
 
-context_aware_chat_llm = ChatOpenAI(
-    model="gpt-4o-mini",
-    temperature=0.1,
-    streaming=True,
-    api_key=OPENAI_API_KEY
+context_aware_chat_llm = get_dynamic_llm(
+    ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=0.1,
+        streaming=True,
+        api_key=OPENAI_API_KEY
+    ),
+    ollama_llm
 )
 
 
@@ -502,24 +546,67 @@ def create_context_aware_chain(page_context=None, use_context=False, video_trans
     )
 
     if image_url:
-        def vision_mapper(inputs):
+        # Vision model (User specified qwen3.5:2b)
+        qwen_vision_llm = ChatOllama(model="qwen3.5:2b", num_predict=2000,model_kwargs={
+        "options": {
+            "think": False  # Disables extended thinking
+        }
+    })
+
+        async def vision_stream_chain(inputs, config=None):
+            import base64, httpx
+
             question = inputs.get("question", "")
             history = inputs.get("chat_history", [])
-            rendered_prompt = prompt_template.format(question=question, chat_history=[]) # Format without history for the text Part
             
+            # Prepare message list for Ollama vision
+            # System instruction + history + current message with image
+            system_prompt = "You are a concise vision assistant. Provide straight, direct answers based on the image. No preamble, no over-thinking, no filler."
+            text_prompt = f"{system_prompt}\n\nQuestion: {question}"
+
+            # Convert HTTP URL to base64 (Ollama requires base64, not HTTP URLs)
+            final_image_url = image_url
+            if final_image_url.startswith("http"):
+                try:
+                    print(f"📥 Fetching image for vision: {final_image_url[:80]}...")
+                    async with httpx.AsyncClient(timeout=20) as client:
+                        resp = await client.get(final_image_url)
+                        if resp.status_code == 200:
+                            encoded = base64.b64encode(resp.content).decode('utf-8')
+                            mime = resp.headers.get('Content-Type', 'image/jpeg').split(';')[0]
+                            final_image_url = f"data:{mime};base64,{encoded}"
+                            print(f"✅ Image → base64 ({len(encoded)} chars), mime={mime}")
+                        else:
+                            print(f"❌ Image fetch failed: HTTP {resp.status_code}")
+                except Exception as e:
+                    print(f"⚠️ Vision Image Fetch Error: {e}")
+
+            # Construct messages: History (text) + Current (text + image)
             messages = []
-            # Add history messages
-            messages.extend(history)
+            for msg in history:
+                messages.append(msg)
             
-            # Add the current human message with image
             messages.append(HumanMessage(content=[
-                {"type": "text", "text": rendered_prompt},
-                {"type": "image_url", "image_url": {"url": image_url}}
+                {"type": "text", "text": text_prompt},
+                {"type": "image_url", "image_url": {"url": final_image_url}}
             ]))
-            
-            return messages
-        
-        return RunnableLambda(vision_mapper) | context_aware_chat_llm
+
+            print(f"🦙 Vision → qwen3.5:2b | history_len: {len(history)} | image_url: {final_image_url[:30]}...")
+            full = ""
+            chunk_count = 0
+            async for chunk in qwen_vision_llm.astream(messages):
+                chunk_count += 1
+                content = chunk.content if isinstance(chunk.content, str) else ""
+                if content:
+                    full += content
+                    yield chunk
+            print(f"✅ Vision stream done: {chunk_count} chunks, {len(full)} chars")
+            if len(full) == 0:
+                print("⚠️ 0 chars returned — qwen3.5:2b may not have vision support or image was invalid.")
+
+        return RunnableLambda(vision_stream_chain)
+
+        return RunnableLambda(vision_stream_chain)
     else:
         return prompt_template | context_aware_chat_llm
 
@@ -538,7 +625,7 @@ chat_llm = ChatOpenAI(
     temperature=0.1,
     streaming=True,
     api_key=OPENAI_API_KEY
-)
+).with_fallbacks([ollama_llm])
 
 runnable_chain = chat_prompt | chat_llm
 
@@ -598,11 +685,14 @@ Return ONLY this JSON:
 User query: {question}
 """)
 
-classifier_llm = ChatOpenAI(
-    model="gpt-4o-mini",
-    temperature=0,
-    streaming=False,
-    api_key=OPENAI_API_KEY
+classifier_llm = get_dynamic_llm(
+    ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=0,
+        streaming=False,
+        api_key=OPENAI_API_KEY
+    ),
+    ollama_json_llm
 )
 
 classifier_chain = classifier_prompt | classifier_llm | JsonOutputParser()
@@ -641,11 +731,14 @@ User query: {question}
 Primary intent: {primary_intent}
 """)
 
-rich_content_llm = ChatOpenAI(
-    model="gpt-4o-mini",
-    temperature=0.3,
-    streaming=False,
-    api_key=OPENAI_API_KEY
+rich_content_llm = get_dynamic_llm(
+    ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=0.3,
+        streaming=False,
+        api_key=OPENAI_API_KEY
+    ),
+    ollama_json_llm
 )
 
 rich_content_chain = rich_content_prompt | rich_content_llm | JsonOutputParser()
@@ -666,11 +759,14 @@ User query:
 {question}
 """)
 
-explain_llm = ChatOpenAI(
-    model="gpt-4o-mini",
-    temperature=0.2,
-    streaming=True,
-    api_key=OPENAI_API_KEY
+explain_llm = get_dynamic_llm(
+    ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=0.2,
+        streaming=True,
+        api_key=OPENAI_API_KEY
+    ),
+    ollama_llm
 )
 
 explain_chain = explain_prompt | explain_llm
@@ -852,11 +948,14 @@ User query: {question}
 Primary intent: {primary_intent}
 """)
 
-agent_llm = ChatOpenAI(
-    model="gpt-4o-mini",
-    temperature=0,
-    streaming=False,
-    api_key=OPENAI_API_KEY
+agent_llm = get_dynamic_llm(
+    ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=0,
+        streaming=False,
+        api_key=OPENAI_API_KEY
+    ),
+    ollama_json_llm
 )
 
 agent_chain = agent_prompt | agent_llm | JsonOutputParser()
@@ -914,11 +1013,14 @@ Return ONLY JSON:
 }}
 """)
 
-action_intent_llm = ChatOpenAI(
-    model="gpt-4o-mini",
-    temperature=0,
-    streaming=False,
-    api_key=OPENAI_API_KEY
+action_intent_llm = get_dynamic_llm(
+    ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=0,
+        streaming=False,
+        api_key=OPENAI_API_KEY
+    ),
+    ollama_json_llm
 )
 
 action_intent_chain = action_intent_prompt | action_intent_llm | JsonOutputParser()
@@ -985,11 +1087,14 @@ If NO DOM action is required:
 """)
 
 
-dom_action_llm = ChatOpenAI(
-    model="gpt-4o-mini",
-    temperature=0,
-    streaming=False,
-    api_key=OPENAI_API_KEY
+dom_action_llm = get_dynamic_llm(
+    ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=0,
+        streaming=False,
+        api_key=OPENAI_API_KEY
+    ),
+    ollama_json_llm
 )
 
 dom_action_chain = dom_action_prompt | dom_action_llm | JsonOutputParser()
@@ -1027,12 +1132,15 @@ rewrite_prompt = ChatPromptTemplate.from_messages([
     )
 ])
 
-rewrite_llm = ChatOpenAI(
-    model="gpt-4o-mini",
-    temperature=0,
-    streaming=False,
-    api_key=OPENAI_API_KEY,
-    model_kwargs={"response_format": {"type": "json_object"}}
+rewrite_llm = get_dynamic_llm(
+    ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=0,
+        streaming=False,
+        api_key=OPENAI_API_KEY,
+        model_kwargs={"response_format": {"type": "json_object"}}
+    ),
+    ollama_json_llm
 )
 
 rewrite_chain = rewrite_prompt | rewrite_llm | JsonOutputParser()
@@ -1075,12 +1183,15 @@ dom_customization_prompt = ChatPromptTemplate.from_messages([
 ])
 
 
-dom_customization_llm = ChatOpenAI(
-    model="gpt-4o-mini",
-    temperature=0.2,  # Slightly higher for creative design choices
-    streaming=False,
-    api_key=OPENAI_API_KEY,
-    model_kwargs={"response_format": {"type": "json_object"}}
+dom_customization_llm = get_dynamic_llm(
+    ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=0.2,  # Slightly higher for creative design choices
+        streaming=False,
+        api_key=OPENAI_API_KEY,
+        model_kwargs={"response_format": {"type": "json_object"}}
+    ),
+    ollama_json_llm
 )
 
 dom_customization_chain = dom_customization_prompt | dom_customization_llm | JsonOutputParser()
@@ -1128,11 +1239,14 @@ Example Output:
 }}
 """)
 
-micro_manifest_llm = ChatOpenAI(
-    model="gpt-4o-mini",
-    temperature=0,
-    streaming=False,
-    api_key=OPENAI_API_KEY
+micro_manifest_llm = get_dynamic_llm(
+    ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=0,
+        streaming=False,
+        api_key=OPENAI_API_KEY
+    ),
+    ollama_json_llm
 )
 
 micro_manifest_chain = micro_manifest_prompt | micro_manifest_llm | JsonOutputParser()
@@ -1163,11 +1277,14 @@ Output JSON:
 }}
 """)
 
-filter_results_llm = ChatOpenAI(
-    model="gpt-4o-mini",
-    temperature=0,
-    streaming=False,
-    api_key=OPENAI_API_KEY
+filter_results_llm = get_dynamic_llm(
+    ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=0,
+        streaming=False,
+        api_key=OPENAI_API_KEY
+    ),
+    ollama_json_llm
 )
 
 filter_results_chain = filter_results_prompt | filter_results_llm | JsonOutputParser()

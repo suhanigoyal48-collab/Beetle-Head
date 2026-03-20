@@ -4,6 +4,10 @@ from typing import Optional, Dict, Any
 import json
 
 class BrowserAutomation:
+    """
+    Utility class for handling browser automation tasks using Playwright.
+    Supports connecting to an existing Chrome instance or launching a new one.
+    """
     def __init__(self):
         self.playwright = None
         self.browser: Optional[Browser] = None
@@ -11,17 +15,20 @@ class BrowserAutomation:
         self.context = None
         
     async def start(self, use_existing_browser: bool = True):
-        """Initialize Playwright browser
+        """
+        Initialize the Playwright browser session.
         
         Args:
-            use_existing_browser: If True, connects to existing Chrome instance
-                                 If False, launches new browser
+            use_existing_browser: If True, attempts to connect to a Chrome instance on port 9222.
+                                 If False or connection fails, launches a new headful browser.
+        
+        Triggers: Playwright driver startup and browser connection/launch.
         """
         if not self.playwright:
             self.playwright = await async_playwright().start()
             
             if use_existing_browser:
-                # Connect to existing Chrome instance via CDP
+                # Connect to existing Chrome instance via CDP (Chrome DevTools Protocol)
                 # Chrome must be launched with --remote-debugging-port=9222
                 try:
                     self.browser = await self.playwright.chromium.connect_over_cdp(
@@ -38,7 +45,11 @@ class BrowserAutomation:
                 await self._launch_new_browser()
     
     async def _launch_new_browser(self):
-        """Launch a new browser instance"""
+        """
+        Launch a new headful Chromium instance with maximization.
+        
+        Triggers: local browser process creation.
+        """
         self.browser = await self.playwright.chromium.launch(
             headless=False,
             args=['--start-maximized']
@@ -47,7 +58,11 @@ class BrowserAutomation:
         print("✅ Launched new Chrome browser")
     
     async def stop(self):
-        """Clean up resources"""
+        """
+        Gracefully shut down the browser session and Playwright driver.
+        
+        Triggers: Browser closure and driver termination.
+        """
         # Don't close browser if we connected to existing one
         if self.context and hasattr(self.browser, '_is_connected'):
             # Only close context if it's a new browser
@@ -58,7 +73,15 @@ class BrowserAutomation:
             await self.playwright.stop()
     
     async def get_or_create_page(self, url: str) -> Page:
-        """Get existing page with URL or create new one"""
+        """
+        Fetch an existing page by URL substring or create a new one if not found.
+        
+        Args:
+            url: The URL or substring to look for in existing pages.
+            
+        Returns:
+            A Playwright Page object.
+        """
         # Check if page already exists
         for page in self.context.pages:
             if url in page.url:
@@ -71,7 +94,12 @@ class BrowserAutomation:
     # ===== SPOTIFY AUTOMATIONS =====
     
     async def spotify_play_song(self, query: str) -> Dict[str, Any]:
-        """Search and play a song on Spotify"""
+        """
+        Search for and play a song on Spotify (Web Player).
+        
+        Expects: A song/artist search query.
+        Triggers: Navigation to Spotify, search interaction, and track selection.
+        """
         try:
             # Find or create Spotify tab
             page = None
@@ -89,7 +117,7 @@ class BrowserAutomation:
             await page.wait_for_load_state("networkidle")
             await asyncio.sleep(2)
             
-            # Click first song
+            # Click first song found in tracklist or top results
             selectors = [
                 'div[data-testid="tracklist-row"]:first-child',
                 'div[data-testid="top-result-card"]',
@@ -103,7 +131,7 @@ class BrowserAutomation:
                 except:
                     continue
             
-            # Bring page to front
+            # Bring the player page to the foreground
             await page.bring_to_front()
             
             return {
@@ -120,7 +148,12 @@ class BrowserAutomation:
     # ===== NETFLIX AUTOMATIONS =====
     
     async def netflix_select_profile(self, profile_name: str = "Main") -> Dict[str, Any]:
-        """Open Netflix and select a profile"""
+        """
+        Open Netflix and automatically select a specific profile.
+        
+        Expects: Profile name (defaults to "Main").
+        Triggers: Navigation to Netflix browse page and click on profile icon.
+        """
         try:
             # Find or create Netflix tab
             page = None
@@ -136,11 +169,12 @@ class BrowserAutomation:
             await page.wait_for_load_state("networkidle")
             await asyncio.sleep(2)
             
-            # Look for profile selection screen
+            # Look for profile selection screen and click target profile
             try:
                 profile_selector = f'a[aria-label*="{profile_name}" i], span:has-text("{profile_name}")'
                 await page.click(profile_selector, timeout=5000)
             except:
+                # Fallback to the first profile if specific one not found
                 await page.click('.profile-link:first-child, .profile-icon:first-child', timeout=5000)
             
             await page.wait_for_load_state("networkidle")
@@ -160,7 +194,12 @@ class BrowserAutomation:
     # ===== YOUTUBE AUTOMATIONS =====
     
     async def youtube_latest_video(self, channel: str) -> Dict[str, Any]:
-        """Open latest video from a YouTube channel"""
+        """
+        Navigate to a specific YouTube channel and play their most recent video.
+        
+        Expects: Channel handle or name (e.g., "@MrBeast").
+        Triggers: Navigation to channel's /videos tab and click on the latest video link.
+        """
         try:
             # Find or create YouTube tab
             page = None
@@ -178,7 +217,7 @@ class BrowserAutomation:
             await page.wait_for_load_state("networkidle")
             await asyncio.sleep(2)
             
-            # Click first video
+            # Click the first video in the list
             await page.click('#video-title-link:first-child, a#video-title:first-child', timeout=5000)
             await page.wait_for_load_state("networkidle")
             await page.bring_to_front()
@@ -195,7 +234,12 @@ class BrowserAutomation:
             }
     
     async def youtube_play_video(self, query: str) -> Dict[str, Any]:
-        """Search and play a YouTube video"""
+        """
+        Search for a video on YouTube and play the first result.
+        
+        Expects: Video title or topic query.
+        Triggers: Navigation to YouTube search and selection of the top result.
+        """
         try:
             # Find or create YouTube tab
             page = None
@@ -212,7 +256,7 @@ class BrowserAutomation:
             await page.wait_for_load_state("networkidle")
             await asyncio.sleep(2)
             
-            # Click first video
+            # Click first video link
             await page.click('a#video-title:first-child', timeout=5000)
             await page.wait_for_load_state("networkidle")
             await page.bring_to_front()
@@ -231,7 +275,12 @@ class BrowserAutomation:
     # ===== GENERIC AUTOMATIONS =====
     
     async def open_url(self, url: str) -> Dict[str, Any]:
-        """Open any URL in existing or new tab"""
+        """
+        Open a provided URL in a new browser tab.
+        
+        Expects: A valid URL string.
+        Triggers: Page creation and navigation.
+        """
         try:
             page = await self.context.new_page()
             await page.goto(url)
@@ -250,7 +299,12 @@ class BrowserAutomation:
             }
     
     async def execute_custom_script(self, url: str, script: str) -> Dict[str, Any]:
-        """Execute custom JavaScript on a page"""
+        """
+        Execute arbitrary JavaScript on a specific page.
+        
+        Expects: URL substring to match the page and the JS script to run.
+        Triggers: Browser evaluate call.
+        """
         try:
             # Find existing page or create new
             page = None
@@ -283,9 +337,14 @@ class BrowserAutomation:
 automation = BrowserAutomation()
 
 async def execute_action(action: Dict[str, Any]) -> Dict[str, Any]:
-    """Execute a single automation action"""
+    """
+    Dispatcher function to execute various browser automation actions based on type.
     
-    # Ensure browser is started and connected
+    Expects: An action dictionary with a "type" key (e.g., "spotify_play_song", "youtube_play_video").
+    Triggers: The corresponding method in the BrowserAutomation class.
+    """
+    
+    # Ensure browser is started and connected before any action
     await automation.start(use_existing_browser=True)
     
     action_type = action.get("type")
@@ -318,7 +377,12 @@ async def execute_action(action: Dict[str, Any]) -> Dict[str, Any]:
         }
 
 async def execute_actions_sequence(actions: list) -> list:
-    """Execute multiple actions in sequence"""
+    """
+    Execute a sequence of browser automation actions sequentially.
+    
+    Expects: A list of action dictionaries, each with an "auto" flag set to True.
+    Triggers: Multiple calls to execute_action with 1-second delays.
+    """
     results = []
     
     for action in actions:
@@ -329,7 +393,7 @@ async def execute_actions_sequence(actions: list) -> list:
                 "result": result
             })
             
-            # Small delay between actions
+            # Small delay between actions to avoid rate limiting or UI race conditions
             await asyncio.sleep(1)
     
     return results

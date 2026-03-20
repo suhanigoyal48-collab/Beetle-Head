@@ -30,20 +30,32 @@ export default function App() {
   const { saveContext } = useContextSync();
   const lastDetectedUrlRef = useRef('');
 
-  const checkForYouTubeVideo = useCallback(async (tab) => {
-    if (!tab?.url?.includes('youtube.com/watch')) return;
+  const checkForYouTubeVideo = useCallback(async (tab, externalInfo = null) => {
+    const url = tab?.url || externalInfo?.url;
+    if (!url?.includes('youtube.com/watch')) return;
 
-    // Global deduplication check
+    // Global deduplication check - find if this video is already the last system message
+    // or if we already have it in history to avoid spamming
     const isDuplicate = state.messages.some(m =>
       m.role === 'system' &&
       m.videoPreview &&
-      m.videoPreview.url === tab.url
+      m.videoPreview.url === url
     );
     if (isDuplicate) return;
 
     // Local ref check as second layer
-    if (lastDetectedUrlRef.current === tab.url) return;
-    lastDetectedUrlRef.current = tab.url;
+    if (lastDetectedUrlRef.current === url) return;
+    lastDetectedUrlRef.current = url;
+
+    if (externalInfo) {
+      addMessage('system', '', { 
+        videoPreview: { 
+          ...externalInfo, 
+          thumbnail: `https://img.youtube.com/vi/${extractVideoId(externalInfo.url)}/mqdefault.jpg` 
+        } 
+      });
+      return;
+    }
 
     try {
       const results = await chrome.scripting.executeScript({
@@ -100,14 +112,78 @@ export default function App() {
             videoId,
             data: { currentTime, duration, title, url, lastUpdated: Date.now() }
           });
+          
+          // 🆕 Automatically show preview card if it doesn't exist
+          checkForYouTubeVideo(null, msg.data);
         }
+      }
+      if (msg.type === 'SCREENSHOT_CAPTURED') {
+        addMessage('system', 'Screenshot captured!', { screenshot: msg.image });
+        dispatch({ type: 'SET_ATTACHED_IMAGE', url: msg.image });
+      }
+      if (msg.type === 'RECORDING_DATA') {
+        addMessage('system', 'Screen recording complete!', { video: msg.video });
+      }
+      if (msg.type === 'CIRCLE_SEARCH_RESULT') {
+        addMessage('system', 'Circle Search complete!', { 
+          screenshot: msg.imageData,
+          metadata: { url: msg.pageUrl, title: msg.pageTitle }
+        });
+        dispatch({ type: 'SET_ATTACHED_IMAGE', url: msg.imageData });
+      }
+
+      if (msg.type === 'SMART_SNAPSHOT_START') {
+        dispatch({ type: 'SET_TAB', tab: 'chats' });
+        dispatch({ 
+            type: 'ADD_MESSAGE', 
+            message: { 
+                id: msg.taskId, 
+                role: 'snapshot-progress', 
+                format: msg.format, 
+                progress: 0, 
+                statusText: "Initializing...",
+                completed: false,
+                isError: false
+            } 
+        });
+      }
+      if (msg.type === 'SMART_SNAPSHOT_PROGRESS') {
+        dispatch({
+            type: 'UPDATE_MESSAGE_BY_ID',
+            id: msg.taskId,
+            updates: { progress: msg.progress, statusText: msg.messageText }
+        });
+      }
+      if (msg.type === 'SMART_SNAPSHOT_COMPLETE') {
+        dispatch({
+            type: 'UPDATE_MESSAGE_BY_ID',
+            id: msg.taskId,
+            updates: { 
+                completed: true, 
+                progress: 100, 
+                statusText: `✅ ${msg.filename} generated!`,
+                downloadUrl: msg.downloadUrl,
+                filename: msg.filename
+            }
+        });
+      }
+      if (msg.type === 'SMART_SNAPSHOT_ERROR') {
+        dispatch({
+            type: 'UPDATE_MESSAGE_BY_ID',
+            id: msg.taskId,
+            updates: { 
+                isError: true, 
+                statusText: `❌ Snapshot failed: ${msg.error}`
+            }
+        });
       }
     };
 
     chrome.runtime.onMessage.addListener(handler);
 
     const onTabUpdated = (tabId, changeInfo, tab) => {
-      if (changeInfo.status === 'complete' && tab.active) {
+      // Trigger on status change OR URL change (YouTube SPA navigation)
+      if ((changeInfo.status === 'complete' || changeInfo.url) && tab.active) {
         checkForYouTubeVideo(tab);
       }
     };
@@ -281,7 +357,11 @@ export default function App() {
             {/* Tabs Carousel Overlay */}
             {tabsCarouselOpen && (
               <TabsCarousel
-                onTabSelected={(tabId, url, title) => saveContext(tabId, url, title)}
+                onTabSelected={(tabId, url, title) => {
+                  saveContext(tabId, url, title);
+                  // 🔹 Synchronize the active context so the chat knows which URL to use
+                  dispatch({ type: 'SET_CONTEXT', tabId, url, content: null });
+                }}
               />
             )}
 

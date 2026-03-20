@@ -1,7 +1,7 @@
 import { useEffect, useCallback, useRef } from 'react';
 import { useApp } from '../store/AppContext';
 import { API } from '../constants/api';
-import { isRestrictedPage } from '../utils/helpers';
+import { isRestrictedPage, downloadJSON } from '../utils/helpers';
 import { extractDOMTree } from '../utils/domExtractor';
 
 export function useContextSync() {
@@ -20,6 +20,9 @@ export function useContextSync() {
             const pageContext = results?.[0]?.result;
 
             if (pageContext) {
+                // Download the extracted JSON
+                // downloadJSON(pageContext, `context-sync-${Date.now()}.json`);
+
                 const token = state.accessToken;
                 if (!token) return;
 

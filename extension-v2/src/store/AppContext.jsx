@@ -30,6 +30,7 @@ const initialState = {
     autoScroll: true,
     agentMode: false,
     domMode: false,
+    preferredModel: 'openai', // 'openai' | 'ollama'
 
     // Image attachment
     attachedImageUrl: null,
@@ -105,12 +106,19 @@ function appReducer(state, action) {
                 msgs[lastBotIdx] = { ...msgs[lastBotIdx], ...action.updates };
             }
             return { ...state, messages: msgs };
+        case 'UPDATE_MESSAGE_BY_ID':
+            return {
+                ...state,
+                messages: state.messages.map(m => m.id === action.id ? { ...m, ...action.updates } : m)
+            };
 
         // Streaming
         case 'SET_STREAMING':
             return { ...state, isStreaming: action.value };
         case 'SET_CONVERSATION_ID':
             return { ...state, conversationId: action.id };
+        case 'SET_PREFERRED_MODEL':
+            return { ...state, preferredModel: action.value };
 
         // Agent/DOM modes
         case 'SET_AGENT_MODE':

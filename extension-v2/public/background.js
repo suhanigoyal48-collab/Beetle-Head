@@ -126,8 +126,72 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "TAKE_SCREENSHOT") {
-    chrome.tabs.captureVisibleTab(null, { format: "png" }, (dataUrl) => {
-      sendResponse({ success: !!dataUrl, image: dataUrl });
+    (async () => {
+      try {
+        if (message.screenshotType === 'fullpage') {
+          const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+          const response = await fetch("http://localhost:8000/snapshot", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ url: tab.url, format: "png" })
+          });
+          const data = await response.json();
+          pollSnapshotStatus(data.task_id, 'png');
+          sendResponse({ success: true, taskId: data.task_id });
+        } else {
+          chrome.tabs.captureVisibleTab(null, { format: "png" }, (dataUrl) => {
+            if (dataUrl) {
+              chrome.runtime.sendMessage({ type: "SCREENSHOT_CAPTURED", image: dataUrl }).catch(() => {});
+              sendResponse({ success: true, image: dataUrl });
+            } else {
+              sendResponse({ success: false });
+            }
+          });
+        }
+      } catch (err) {
+        console.error("❌ Screenshot failed:", err);
+        sendResponse({ success: false, error: err.message });
+      }
+    })();
+    return true;
+  }
+
+  if (message.type === "SMART_SNAPSHOT") {
+    (async () => {
+      try {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        const format = message.snapshotType || "pdf";
+        const response = await fetch("http://localhost:8000/snapshot", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: tab.url, format: format })
+        });
+        const data = await response.json();
+        
+        // Notify UI to show the loader
+        chrome.runtime.sendMessage({
+          type: "SMART_SNAPSHOT_START",
+          taskId: data.task_id,
+          format: format
+        }).catch(() => {});
+
+        pollSnapshotStatus(data.task_id, format);
+        sendResponse({ success: true, taskId: data.task_id });
+      } catch (err) {
+        console.error("❌ Smart Snapshot failed:", err);
+        sendResponse({ success: false, error: err.message });
+      }
+    })();
+    return true;
+  }
+
+  if (message.type === "TOGGLE_SCREEN_RECORD") {
+    chrome.runtime.getContexts({ contextTypes: ["OFFSCREEN_DOCUMENT"] }).then(contexts => {
+      if (contexts.length > 0) {
+        stopRecording(sendResponse);
+      } else {
+        startRecording(sendResponse);
+      }
     });
     return true;
   }
@@ -774,6 +838,8 @@ async function setupOffscreenDocument() {
   const contexts = await chrome.runtime.getContexts({ contextTypes: ["OFFSCREEN_DOCUMENT"] });
   if (contexts.length > 0) return;
   await chrome.offscreen.createDocument({
+    url: "offscreen.html",
+    reasons: ["DISPLAY_MEDIA"],
     justification: "Screen recording"
   });
 }
@@ -1044,4 +1110,76 @@ async function toggleDarkSite(tabId) {
   } catch (error) {
     console.error("Error toggling dark site:", error);
   }
+}
+
+// ==================================================
+// �� SNAPSHOT POLLING LOGIC
+// ==================================================
+
+async function pollSnapshotStatus(taskId, format) {
+  console.log(`⏳ Starting poll for task ${taskId} (format: ${format})...`);
+  const poll = async () => {
+    try {
+      const resp = await fetch(`http://localhost:8000/snapshot/status/${taskId}`);
+      const statusData = await resp.json();
+
+      // Dispatch progress
+      if (statusData.progress !== undefined && statusData.message) {
+        chrome.runtime.sendMessage({
+          type: "SMART_SNAPSHOT_PROGRESS",
+          taskId: taskId,
+          progress: statusData.progress,
+          messageText: statusData.message
+        }).catch(() => {});
+      }
+
+      if (statusData.status === 'completed') {
+        console.log(`✅ Snapshot ${taskId} completed!`);
+        
+        if (format === 'png') {
+          // Fetch the actual image data
+          const previewResp = await fetch(`http://localhost:8000/snapshot/preview/${taskId}`);
+          const blob = await previewResp.blob();
+          const reader = new FileReader();
+          reader.onloadend = () => {
+            chrome.runtime.sendMessage({
+              type: "SCREENSHOT_CAPTURED",
+              image: reader.result
+            }).catch(() => {});
+            
+            // Send complete signal for loader
+            chrome.runtime.sendMessage({
+              type: "SMART_SNAPSHOT_COMPLETE",
+              taskId: taskId,
+              downloadUrl: null, // Just image for PNG, handled by modal
+              filename: 'snapshot.png'
+            }).catch(() => {});
+          };
+          reader.readAsDataURL(blob);
+        } else {
+          // For PDF/Word etc, we can just send a notification or link
+          const downloadUrl = `http://localhost:8000/snapshot/download/${taskId}`;
+          chrome.runtime.sendMessage({
+            type: "SMART_SNAPSHOT_COMPLETE",
+            taskId: taskId,
+            downloadUrl: downloadUrl,
+            filename: statusData.filename || 'snapshot.pdf'
+          }).catch(() => {});
+        }
+      } else if (statusData.status === 'error') {
+        console.error(`❌ Snapshot ${taskId} failed:`, statusData.error);
+        chrome.runtime.sendMessage({
+          type: "SMART_SNAPSHOT_ERROR",
+          taskId: taskId,
+          error: statusData.error || "Unknown error occurred"
+        }).catch(() => {});
+      } else {
+        // Keep polling
+        setTimeout(poll, 2000);
+      }
+    } catch (err) {
+      console.error("❌ Polling error:", err);
+    }
+  };
+  poll();
 }
